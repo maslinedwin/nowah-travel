@@ -3,6 +3,8 @@ import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
+import "."
+import "Model.js" as Model
 
 BarWidget {
   id: root
@@ -40,7 +42,12 @@ BarWidget {
   implicitHeight: button.implicitHeight
 
   onBarChanged: injectPanel()
-  onSettingsChanged: injectPanel()
+  onSettingsChanged: {
+    injectPanel()
+    NowahService.configure(root.settings)
+  }
+
+  Component.onCompleted: NowahService.configure(root.settings)
 
   Loader {
     id: panelLoader
@@ -64,20 +71,71 @@ BarWidget {
     function search(query: string): void {
       if (panelLoader.item && panelLoader.item.searchFor) panelLoader.item.searchFor(query)
     }
+    function refresh(): void { NowahService.refreshNow() }
+    function connect(): void { NowahService.startPairing() }
   }
 
   WidgetButton {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "\uf072"
+    text: {
+      var base = "\uf072"
+      var m = NowahService.monitor
+      if (m && (m.state === "countdown" || m.state === "prep")
+          && m.daysUntil !== undefined && m.daysUntil >= 0
+          && m.daysUntil <= NowahService.countdownDays)
+        return base + " " + Model.countdownShort(m.daysUntil)
+      return base
+    }
     active: root.opened
-    tooltipText: "Nowah — flights, hotels, eSIM, trip plans"
+    tooltipText: {
+      var base = "Nowah — flights, hotels, eSIM, trip plans"
+      var m = NowahService.monitor
+      var trip = m && m.trip ? m.trip
+        : (NowahService.upcoming.length > 0 ? NowahService.upcoming[0] : null)
+      if (!trip) return base
+      var place = trip.destinationCity || trip.destination || trip.name || "trip"
+      if (m && m.state === "active_flight") return base + "\nIn flight · " + place
+      if (m && m.state === "in_destination") return base + "\nIn " + place
+      var days = -1
+      if (m && m.trip && m.daysUntil !== undefined) days = m.daysUntil
+      else {
+        var st = Model.parseBookingDate(trip.startDate)
+        if (st) days = Model.calendarDaysUntil(st, NowahService.now)
+      }
+      if (days < 0) return base
+      return base + "\nNext: " + place + " " + Model.countdownLabel(days).toLowerCase()
+    }
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton)
-        Quickshell.execDetached(["omarchy-launch-webapp", "https://app.nowah.xyz"])
+        Quickshell.execDetached(["omarchy-launch-webapp", NowahService.appUrl || "https://app.nowah.xyz"])
       else
         root.toggle()
+    }
+
+    // Flight-day status dot (bottom right) — mirrors the hero card color.
+    Rectangle {
+      visible: NowahService.flightDay && NowahService.heroCard !== null
+      anchors.right: parent.right
+      anchors.bottom: parent.bottom
+      anchors.margins: 2
+      width: 6
+      height: 6
+      radius: 3
+      color: NowahService.heroCard ? NowahService.heroCard.statusColor : Model.BRAND.jade
+    }
+
+    // Quiet unread-notifications dot (top right) — yields to the flight dot.
+    Rectangle {
+      visible: NowahService.showNotifications && NowahService.unreadCount > 0 && !NowahService.flightDay
+      anchors.right: parent.right
+      anchors.top: parent.top
+      anchors.margins: 2
+      width: 4
+      height: 4
+      radius: 2
+      color: Model.BRAND.jadeText
     }
   }
 }

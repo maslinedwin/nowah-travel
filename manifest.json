@@ -2,18 +2,18 @@
   "schemaVersion": 1,
   "id": "xyz.nowah.travel",
   "name": "Nowah",
-  "version": "0.3.0",
+  "version": "1.0.0",
   "author": "Nowah",
   "license": "MIT",
-  "description": "AI travel search from the bar — flights, hotels, eSIMs, visas, and trip plans, opening in a dedicated Nowah app window.",
+  "description": "AI travel search plus your live Nowah trips in the bar — next-trip countdown, flight-day status dot, unread notifications, and one-keystroke deep links into a dedicated Nowah app window.",
   "homepage": "https://app.nowah.xyz",
   "repository": "https://github.com/maslinedwin/nowah-travel",
-  "keywords": ["travel", "flights", "hotels", "esim", "visa", "trips", "ai"],
-  "kinds": ["bar-widget"],
-  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "keywords": ["travel", "flights", "hotels", "esim", "visa", "trips", "ai", "live-trips", "countdown", "flight-status"],
+  "kinds": ["bar-widget", "service"],
+  "entryPoints": { "barWidget": "BarWidget.qml", "service": "Service.qml" },
   "barWidget": {
     "displayName": "Nowah",
-    "description": "AI travel search — flights, hotels, eSIM, visas, trip plans",
+    "description": "AI travel search + live trips — countdown, flight status, deep links",
     "category": "Travel",
     "allowMultiple": false,
     "defaultSection": "right"
@@ -32,6 +32,36 @@
       "label": "Rotate example searches",
       "defaultValue": true,
       "description": "Cycle through example queries in the search placeholder."
+    },
+    {
+      "key": "apiUrl",
+      "type": "string",
+      "label": "API URL",
+      "defaultValue": "https://api.nowah.xyz",
+      "description": "Nowah API endpoint used by the read-only trip sync (change for staging)."
+    },
+    {
+      "key": "appUrl",
+      "type": "string",
+      "label": "App URL",
+      "defaultValue": "https://app.nowah.xyz",
+      "description": "Nowah web app opened by searches, trip cards, and deep links."
+    },
+    {
+      "key": "showNotifications",
+      "type": "boolean",
+      "label": "Show unread notifications",
+      "defaultValue": true,
+      "description": "Poll the unread-notification count and show a quiet jade dot on the bar icon."
+    },
+    {
+      "key": "countdownDays",
+      "type": "integer",
+      "label": "Countdown window (days)",
+      "defaultValue": 14,
+      "minimum": 1,
+      "maximum": 60,
+      "description": "Show the next-trip countdown beside the bar icon when departure is within this many days."
     }
   ]
 }
