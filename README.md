@@ -21,6 +21,14 @@ omarchy plugin add https://github.com/maslinedwin/nowah-travel --enable
 
 Or from the Omarchy menu: **Setup > Plugins**.
 
+To remove:
+
+```bash
+omarchy plugin remove xyz.nowah.travel
+```
+
+The plugin writes no configuration and leaves nothing behind on removal. Its only external dependency is `omarchy-launch-webapp` (part of Omarchy), which opens the app in a Chromium-family browser window.
+
 ## Develop locally
 
 Copy this directory to the plugin location, named by its id:
