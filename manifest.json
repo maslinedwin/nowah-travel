@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "xyz.nowah.travel",
+  "name": "Nowah",
+  "version": "0.1.0",
+  "author": "Nowah",
+  "license": "MIT",
+  "description": "AI travel search from the bar — flights, hotels, eSIMs, visas, and trip plans, opening in a dedicated Nowah app window.",
+  "homepage": "https://app.nowah.xyz",
+  "repository": "https://github.com/maslinedwin/nowah-travel",
+  "keywords": ["travel", "flights", "hotels", "esim", "visa", "trips", "ai"],
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "Nowah",
+    "description": "AI travel search — flights, hotels, eSIM, visas, trip plans",
+    "category": "Travel",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
