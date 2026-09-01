@@ -1,0 +1,70 @@
+<svg width="680" height="560" viewBox="0 0 680 560" xmlns="http://www.w3.org/2000/svg" font-family="'JetBrains Mono','Cascadia Mono',ui-monospace,monospace">
+  <defs>
+    <clipPath id="card"><rect x="40" y="40" width="600" height="480" rx="18"/></clipPath>
+  </defs>
+
+  <rect width="680" height="560" fill="#0b0c0f"/>
+
+  <!-- panel card -->
+  <rect x="40" y="40" width="600" height="480" rx="18" fill="#12141a" stroke="#23262f" stroke-width="1.5"/>
+
+  <g clip-path="url(#card)">
+    <!-- brand row -->
+    <path d="M86 78 l16 -7 -6 7 6 7 -16 -7 z" fill="#57c88f"/>
+    <text x="112" y="83" fill="#6b7280" font-size="12" letter-spacing="3">NOWAH</text>
+
+    <!-- hero -->
+    <text x="84" y="128" fill="#e7e9ee" font-size="30" font-weight="700">Where to?</text>
+
+    <!-- search input -->
+    <rect x="84" y="152" width="512" height="52" rx="14" fill="#171b22" stroke="#57c88f" stroke-width="1.5"/>
+    <circle cx="112" cy="178" r="7" fill="none" stroke="#57c88f" stroke-width="2"/>
+    <line x1="117" y1="183" x2="123" y2="189" stroke="#57c88f" stroke-width="2" stroke-linecap="round"/>
+    <text x="136" y="183" fill="#5c6370" font-size="14">Flights to Tokyo in March</text>
+    <rect x="492" y="164" width="90" height="28" rx="14" fill="#57c88f" fill-opacity="0.16"/>
+    <text x="507" y="183" fill="#57c88f" font-size="12" font-weight="700">Search ↵</text>
+
+    <!-- tiles: 3 x 2 -->
+    <g stroke-width="1.5">
+      <!-- row 1 -->
+      <rect x="84" y="224" width="162" height="76" rx="14" fill="#57c88f" fill-opacity="0.10" stroke="#57c88f"/>
+      <path d="M157 246 l20 -9 -8 9 8 9 -20 -9 z" fill="#57c88f"/>
+      <text x="165" y="284" fill="#e7e9ee" font-size="12" text-anchor="middle">Flights</text>
+
+      <rect x="259" y="224" width="162" height="76" rx="14" fill="#161920" stroke="#242833"/>
+      <path d="M328 252 h24 v-8 a4 4 0 0 0 -4 -4 h-10 v8 h-10 z m0 0 v-14" fill="none" stroke="#cfd3db" stroke-width="2" stroke-linecap="round"/>
+      <text x="340" y="284" fill="#8b91a0" font-size="12" text-anchor="middle">Hotels</text>
+
+      <rect x="434" y="224" width="162" height="76" rx="14" fill="#161920" stroke="#242833"/>
+      <path d="M515 234 a9 9 0 0 1 9 9 c0 7 -9 15 -9 15 s-9 -8 -9 -15 a9 9 0 0 1 9 -9 z" fill="none" stroke="#cfd3db" stroke-width="2"/>
+      <text x="515" y="284" fill="#8b91a0" font-size="12" text-anchor="middle">Trips</text>
+
+      <!-- row 2 -->
+      <rect x="84" y="312" width="162" height="76" rx="14" fill="#161920" stroke="#242833"/>
+      <path d="M153 326 l8 4 8 -4 8 4 v18 l-8 -4 -8 4 -8 -4 z" fill="none" stroke="#cfd3db" stroke-width="2" stroke-linejoin="round"/>
+      <text x="165" y="372" fill="#8b91a0" font-size="12" text-anchor="middle">Plans</text>
+
+      <rect x="259" y="312" width="162" height="76" rx="14" fill="#161920" stroke="#242833"/>
+      <rect x="329" y="326" width="22" height="26" rx="4" fill="none" stroke="#cfd3db" stroke-width="2"/>
+      <path d="M336 340 h8 m-8 6 h8" stroke="#cfd3db" stroke-width="2" stroke-linecap="round"/>
+      <text x="340" y="372" fill="#8b91a0" font-size="12" text-anchor="middle">eSIM</text>
+
+      <rect x="434" y="312" width="162" height="76" rx="14" fill="#161920" stroke="#242833"/>
+      <rect x="500" y="328" width="30" height="22" rx="4" fill="none" stroke="#cfd3db" stroke-width="2"/>
+      <circle cx="509" cy="337" r="3" fill="#cfd3db"/>
+      <path d="M518 334 h8 m-8 6 h8" stroke="#cfd3db" stroke-width="2" stroke-linecap="round"/>
+      <text x="515" y="372" fill="#8b91a0" font-size="12" text-anchor="middle">Visa</text>
+    </g>
+
+    <!-- recent -->
+    <text x="84" y="422" fill="#6b7280" font-size="11" letter-spacing="2.5">RECENT</text>
+    <text x="596" y="422" fill="#6b7280" font-size="11" text-anchor="end">clear</text>
+    <rect x="84" y="434" width="196" height="30" rx="15" fill="none" stroke="#2a2e39" stroke-width="1.5"/>
+    <text x="100" y="453" fill="#8b91a0" font-size="12">Weekend in Lisbon</text>
+    <rect x="290" y="434" width="220" height="30" rx="15" fill="none" stroke="#2a2e39" stroke-width="1.5"/>
+    <text x="306" y="453" fill="#8b91a0" font-size="12">eSIM for two weeks</text>
+
+    <!-- footer hints -->
+    <text x="84" y="498" fill="#5c6370" font-size="11">→ use suggestion&#160;&#160;·&#160;&#160;↵ search&#160;&#160;·&#160;&#160;esc close</text>
+  </g>
+</svg>

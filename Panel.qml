@@ -27,6 +27,7 @@ Panel {
     "5-day Rome itinerary with kids"
   ]
   property int placeholderIndex: 0
+  property var recents: []
 
   // `path` deep-links straight into the app window; `prefix` seeds the search
   // box instead, since flight/hotel search has no URL of its own — it runs
@@ -36,9 +37,28 @@ Panel {
     { icon: "\uf236", label: "Hotels", prefix: "Hotels in " },
     { icon: "\uf5a0", label: "Trips", path: "/trips" },
     { icon: "\uf279", label: "Plans", path: "/plan" },
-    { icon: "\uf7c0", label: "eSIM", path: "/esim" },
+    { icon: "\uf7c4", label: "eSIM", path: "/esim" },
     { icon: "\uf2c2", label: "Visa", path: "/visa" }
   ]
+
+  function cfg(key, fallback) {
+    var s = root.hostWidget ? root.hostWidget.settings : null
+    return s && s[key] !== undefined ? s[key] : fallback
+  }
+
+  function syncRecents() {
+    var s = root.hostWidget ? root.hostWidget.settings : null
+    if (s && s.recentSearches && s.recentSearches.length !== undefined)
+      root.recents = s.recentSearches
+  }
+
+  onHostWidgetChanged: syncRecents()
+
+  Connections {
+    target: root.hostWidget
+    ignoreUnknownSignals: true
+    function onSettingsChanged() { root.syncRecents() }
+  }
 
   function open() {
     root.controller.show()
@@ -64,11 +84,29 @@ Panel {
     root.close()
   }
 
-  function submitQuery() {
-    var q = queryInput.text.trim()
+  function rememberSearch(q) {
+    var next = [q]
+    for (var i = 0; i < root.recents.length && next.length < 4; i++)
+      if (root.recents[i] !== q) next.push(root.recents[i])
+    root.recents = next
+    if (root.hostWidget && typeof root.hostWidget.saveRecents === "function")
+      root.hostWidget.saveRecents(next)
+  }
+
+  function clearRecents() {
+    root.recents = []
+    if (root.hostWidget && typeof root.hostWidget.saveRecents === "function")
+      root.hostWidget.saveRecents([])
+  }
+
+  function searchFor(query) {
+    var q = String(query || "").trim()
     if (q === "") return
+    root.rememberSearch(q)
     root.launch("/?q=" + encodeURIComponent(q))
   }
+
+  function submitQuery() { root.searchFor(queryInput.text) }
 
   function seedQuery(prefix) {
     queryInput.text = prefix
@@ -167,6 +205,14 @@ Panel {
             Keys.onReturnPressed: root.submitQuery()
             Keys.onEnterPressed: root.submitQuery()
             Keys.onEscapePressed: root.close()
+            Keys.onRightPressed: function(event) {
+              if (queryInput.text === "") root.seedQuery(placeholderText.text)
+              else event.accepted = false
+            }
+            Keys.onDownPressed: function(event) {
+              if (queryInput.text === "") placeholderSwap.restart()
+              else event.accepted = false
+            }
 
             Text {
               id: placeholderText
@@ -215,7 +261,7 @@ Panel {
 
           Timer {
             interval: 3200
-            running: root.opened && queryInput.text === ""
+            running: root.opened && queryInput.text === "" && root.cfg("rotateExamples", true)
             repeat: true
             onTriggered: placeholderSwap.restart()
           }
@@ -294,9 +340,93 @@ Panel {
           }
         }
 
+        Column {
+          visible: root.cfg("showRecent", true) && root.recents.length > 0
+          width: parent.width
+          spacing: Style.space(6)
+
+          Item {
+            width: parent.width
+            height: recentLabel.implicitHeight
+
+            Text {
+              id: recentLabel
+              anchors.left: parent.left
+              text: "Recent"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.letterSpacing: 1.2
+              font.capitalization: Font.AllUppercase
+            }
+
+            Text {
+              anchors.right: parent.right
+              text: "clear"
+              color: clearMouse.containsMouse ? root.accent : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+
+              Behavior on color { ColorAnimation { duration: 120 } }
+
+              MouseArea {
+                id: clearMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.clearRecents()
+              }
+            }
+          }
+
+          Flow {
+            width: parent.width
+            spacing: Style.space(6)
+
+            Repeater {
+              model: root.recents
+
+              Rectangle {
+                id: recentPill
+                required property string modelData
+                width: Math.min(recentText.implicitWidth + Style.space(16), grid.width)
+                height: recentText.implicitHeight + Style.space(10)
+                radius: height / 2
+                color: recentMouse.containsMouse ? Qt.alpha(root.accent, 0.10) : "transparent"
+                border.width: 1
+                border.color: recentMouse.containsMouse ? Qt.alpha(root.accent, 0.85) : Qt.alpha(root.fg, 0.14)
+
+                Behavior on color { ColorAnimation { duration: 120 } }
+                Behavior on border.color { ColorAnimation { duration: 120 } }
+
+                Text {
+                  id: recentText
+                  anchors.centerIn: parent
+                  width: Math.min(implicitWidth, recentPill.width - Style.space(14))
+                  text: recentPill.modelData
+                  color: recentMouse.containsMouse ? root.fg : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
+
+                  Behavior on color { ColorAnimation { duration: 120 } }
+                }
+
+                MouseArea {
+                  id: recentMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.searchFor(recentPill.modelData)
+                }
+              }
+            }
+          }
+        }
+
         Text {
           width: parent.width
-          text: "↵ search in the Nowah app  ·  esc close"
+          text: "→ use suggestion  ·  ↵ search  ·  esc close"
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption

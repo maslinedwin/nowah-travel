@@ -1,5 +1,6 @@
 import QtQuick
 import Quickshell
+import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
@@ -17,6 +18,17 @@ BarWidget {
   function toggle() { if (panelLoader.item) panelLoader.item.toggle() }
   function closeForPopoutSwitch() { if (panelLoader.item) panelLoader.item.closeForPopoutSwitch() }
 
+  // Applied locally first so the panel updates on the action itself; the
+  // shell.json write comes back through the bar as the same value.
+  function saveRecents(list) {
+    var entry = { id: root.moduleName }
+    for (var key in root.settings) if (key !== "id") entry[key] = root.settings[key]
+    entry.recentSearches = list
+    root.settings = entry
+    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
+      root.bar.shell.updateEntryInline(root.moduleName, entry)
+  }
+
   function injectPanel() {
     if (!panelLoader.item) return
     panelLoader.item.bar = root.bar
@@ -28,6 +40,7 @@ BarWidget {
   implicitHeight: button.implicitHeight
 
   onBarChanged: injectPanel()
+  onSettingsChanged: injectPanel()
 
   Loader {
     id: panelLoader
@@ -37,6 +50,19 @@ BarWidget {
     onLoaded: {
       root.injectPanel()
       Qt.callLater(root.injectPanel)
+    }
+  }
+
+  IpcHandler {
+    target: "xyz.nowah.travel"
+
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function show(): void { root.open() }
+    function hide(): void { root.close() }
+    function toggle(): void { root.toggle() }
+    function search(query: string): void {
+      if (panelLoader.item && panelLoader.item.searchFor) panelLoader.item.searchFor(query)
     }
   }
 

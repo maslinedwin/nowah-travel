@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "xyz.nowah.travel",
   "name": "Nowah",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": "Nowah",
   "license": "MIT",
   "description": "AI travel search from the bar — flights, hotels, eSIMs, visas, and trip plans, opening in a dedicated Nowah app window.",
@@ -17,5 +17,21 @@
     "category": "Travel",
     "allowMultiple": false,
     "defaultSection": "right"
-  }
+  },
+  "schema": [
+    {
+      "key": "showRecent",
+      "type": "boolean",
+      "label": "Show recent searches",
+      "defaultValue": true,
+      "description": "Keep your last few searches in the panel as one-click pills."
+    },
+    {
+      "key": "rotateExamples",
+      "type": "boolean",
+      "label": "Rotate example searches",
+      "defaultValue": true,
+      "description": "Cycle through example queries in the search placeholder."
+    }
+  ]
 }

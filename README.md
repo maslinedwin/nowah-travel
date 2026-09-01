@@ -1,17 +1,21 @@
 # Nowah for Omarchy
 
-An [Omarchy](https://omarchy.org) shell plugin for [Nowah](https://app.nowah.xyz), the AI travel booking app. Adds a Nowah button to the bar with a "Where to?" panel: type a query (flights, hotels, anything) and it opens in a dedicated Nowah app window with the search already running. Quick chips jump straight to Trips, Plans, eSIM, and Visa.
+An [Omarchy](https://omarchy.org) shell plugin for [Nowah](https://app.nowah.xyz), the AI travel booking app. A Nowah button in the bar opens a "Where to?" panel: type anything — flights, hotels, itineraries — and it opens in a dedicated Nowah app window with the search already running.
 
-- **Left click** the bar icon — open the search panel
-- **Right click** — open the Nowah app window directly
-- **Enter** in the panel — run the search in the app window
-- **Flights / Hotels chips** — seed the search box; **Trips / Plans / eSIM / Visa** — deep-link into the app
+<p align="center">
+  <img src="assets/preview.svg" width="560" alt="Nowah panel: search input with rotating suggestions, quick-link tiles, and recent searches"/>
+</p>
 
-Full flows (search results, booking, payment, sign-in) run in the real Nowah web app via `omarchy-launch-webapp`, so nothing is re-implemented in the shell.
+## Features
 
-## Requirements
+- **AI travel search** — Enter opens the Nowah app window with your query running through the AI chat
+- **Quick-link tiles** — Trips, Plans, eSIM, and Visa deep-link straight into the app; Flights and Hotels seed the search box
+- **Rotating suggestions** — example queries cycle in the placeholder; press `→` to use one, `↓` for the next
+- **Recent searches** — your last few queries persist as one-click pills (toggle in plugin settings)
+- **Theme-native** — every color derives from your active Omarchy theme
+- **Scriptable** — IPC target `xyz.nowah.travel` with `toggle`, `open`, `close`, and `search`
 
-Omarchy 4.0 "Quattro" or later (the Quickshell-based shell with plugin support).
+All real flows (results, booking, payment, sign-in) run in the Nowah web app via `omarchy-launch-webapp` — nothing is re-implemented in the shell.
 
 ## Install
 
@@ -27,33 +31,45 @@ To remove:
 omarchy plugin remove xyz.nowah.travel
 ```
 
-The plugin writes no configuration and leaves nothing behind on removal. Its only external dependency is `omarchy-launch-webapp` (part of Omarchy), which opens the app in a Chromium-family browser window.
+The plugin stores only your recent searches (in the shell's own `shell.json`, removable with "clear" in the panel) and has no external dependency beyond `omarchy-launch-webapp` (part of Omarchy), which opens the app in a Chromium-family browser window.
+
+## Usage
+
+- **Left click** the bar icon — open the search panel (`↵` search, `→` use suggestion, `esc` close)
+- **Right click** — open the Nowah app window directly
+- **Flights / Hotels tiles** — seed the search box; **Trips / Plans / eSIM / Visa** — deep-link into the app
+
+### Global hotkey
+
+Summon the panel from anywhere by adding a Hyprland binding:
+
+```ini
+# ~/.config/hypr/bindings.conf
+bindd = SUPER SHIFT N, Nowah, exec, omarchy-shell shell toggle xyz.nowah.travel
+```
+
+### Settings
+
+In **Setup > Plugins > Nowah**: toggle recent searches and the rotating example queries.
+
+## Requirements
+
+Omarchy 4.0 "Quattro" or later (the Quickshell-based shell with plugin support).
 
 ## Develop locally
 
-Copy this directory to the plugin location, named by its id:
-
 ```bash
-cp -r nowah-plugin ~/.config/omarchy/plugins/xyz.nowah.travel
-```
-
-Then enable it via the Omarchy menu (**Setup > Plugins**), or:
-
-```bash
+git clone https://github.com/maslinedwin/nowah-travel ~/.config/omarchy/plugins/xyz.nowah.travel
 omarchy-shell shell rescanPlugins
 omarchy-shell shell setPluginEnabled xyz.nowah.travel true
 ```
 
-Edits to files under `~/.config/omarchy/plugins/` hot-reload automatically. To lint and validate:
+Edits under `~/.config/omarchy/plugins/` hot-reload automatically. Lint and validate with:
 
 ```bash
 qmllint -I "$OMARCHY_PATH/shell" BarWidget.qml Panel.qml
 omarchy plugin validate ~/.config/omarchy/plugins/xyz.nowah.travel
 ```
-
-## Publishing to the marketplace
-
-Submit the repo at [plugins.omarchy.org](https://plugins.omarchy.org) via the issue template on [omacom/omarchy-plugin-marketplace](https://github.com/omacom/omarchy-plugin-marketplace) (verification pins a commit SHA; re-verify after releases).
 
 ## License
 
