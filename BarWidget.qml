@@ -45,6 +45,7 @@ BarWidget {
     anchors.fill: parent
     bar: root.bar
     text: "\uf072"
+    active: root.opened
     tooltipText: "Nowah — flights, hotels, eSIM, trip plans"
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton)

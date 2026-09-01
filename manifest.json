@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "xyz.nowah.travel",
   "name": "Nowah",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Nowah",
   "license": "MIT",
   "description": "AI travel search from the bar — flights, hotels, eSIMs, visas, and trip plans, opening in a dedicated Nowah app window.",
