@@ -2,15 +2,32 @@
   "schemaVersion": 1,
   "id": "xyz.nowah.travel",
   "name": "Nowah",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Nowah",
   "license": "MIT",
   "description": "AI travel search plus your live Nowah trips in the bar — next-trip countdown, flight-day status dot, unread notifications, and one-keystroke deep links into a dedicated Nowah app window.",
   "homepage": "https://app.nowah.xyz",
   "repository": "https://github.com/maslinedwin/nowah-travel",
-  "keywords": ["travel", "flights", "hotels", "esim", "visa", "trips", "ai", "live-trips", "countdown", "flight-status"],
-  "kinds": ["bar-widget", "service"],
-  "entryPoints": { "barWidget": "BarWidget.qml", "service": "Service.qml" },
+  "keywords": [
+    "travel",
+    "flights",
+    "hotels",
+    "esim",
+    "visa",
+    "trips",
+    "ai",
+    "live-trips",
+    "countdown",
+    "flight-status"
+  ],
+  "kinds": [
+    "bar-widget",
+    "service"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "service": "Service.qml"
+  },
   "barWidget": {
     "displayName": "Nowah",
     "description": "AI travel search + live trips — countdown, flight status, deep links",
@@ -32,20 +49,6 @@
       "label": "Rotate example searches",
       "defaultValue": true,
       "description": "Cycle through example queries in the search placeholder."
-    },
-    {
-      "key": "apiUrl",
-      "type": "string",
-      "label": "API URL",
-      "defaultValue": "https://api.nowah.xyz",
-      "description": "Nowah API endpoint used by the read-only trip sync (change for staging)."
-    },
-    {
-      "key": "appUrl",
-      "type": "string",
-      "label": "App URL",
-      "defaultValue": "https://app.nowah.xyz",
-      "description": "Nowah web app opened by searches, trip cards, and deep links."
     },
     {
       "key": "showNotifications",

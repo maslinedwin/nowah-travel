@@ -7,23 +7,22 @@ import "Model.js" as Model
 // NowahService — singleton bridge between bin/nowah-sync (which owns all
 // network and secret handling) and the QML surfaces. It watches the atomic
 // status.json snapshot, derives trip state through Model.js, and schedules
-// refresh / pairing-poll runs. No token ever passes through QML.
+// bounded, supervised helper runs. No token ever passes through QML.
 Item {
   id: root
 
+  // ---- pinned origins (deliberately NOT configurable from plugin settings) ----
+
+  readonly property string apiUrl: "https://api.nowah.xyz"
+  readonly property string appUrl: "https://app.nowah.xyz"
+
   // ---- configuration (injected late via configure(settings); idempotent) ----
 
-  property string apiUrl: "https://api.nowah.xyz"
-  property string appUrl: "https://app.nowah.xyz"
   property bool showNotifications: true
   property int countdownDays: 14
 
   function configure(settings) {
     if (!settings) return
-    if (settings.apiUrl !== undefined && String(settings.apiUrl) !== "")
-      root.apiUrl = String(settings.apiUrl)
-    if (settings.appUrl !== undefined && String(settings.appUrl) !== "")
-      root.appUrl = String(settings.appUrl)
     if (settings.showNotifications !== undefined)
       root.showNotifications = settings.showNotifications === true
     if (settings.countdownDays !== undefined) {
@@ -35,12 +34,16 @@ Item {
   // ---- status snapshot (written by bin/nowah-sync, watched here) ----
 
   readonly property string stateDir: {
-    var override = Quickshell.env("NOWAH_STATE_DIR")
-    if (override && override.length > 0) return override
     var xdg = Quickshell.env("XDG_STATE_HOME")
-    if (!xdg || xdg.length === 0) xdg = Quickshell.env("HOME") + "/.local/state"
+    if (!xdg || String(xdg).indexOf("/") !== 0) {
+      var home = Quickshell.env("HOME")
+      if (!home || String(home).indexOf("/") !== 0) return ""
+      xdg = home + "/.local/state"
+    }
     return xdg + "/nowah-omarchy"
   }
+  // Mirrors the helper's MAX_STATUS_BYTES; anything larger is never parsed.
+  readonly property int maxStatusBytes: 262144
 
   property var status: null
   property date now: new Date()
@@ -49,8 +52,8 @@ Item {
   readonly property string authError: (status && status.auth && status.auth.error) ? String(status.auth.error) : ""
   readonly property var pairing: (status && status.auth) ? (status.auth.pairing || null) : null
   readonly property var profile: (status && status.auth) ? (status.auth.profile || null) : null
-  readonly property var trips: (status && status.trips) ? status.trips : []
-  readonly property int unreadCount: (status && status.unreadCount !== undefined && status.unreadCount !== null) ? status.unreadCount : 0
+  readonly property var trips: (status && Array.isArray(status.trips)) ? status.trips : []
+  readonly property int unreadCount: (status && typeof status.unreadCount === "number") ? status.unreadCount : 0
   readonly property bool stale: !!(status && status.lastSync && status.lastSync.ok === false)
 
   // ---- derived trip state (Model.js is the single source of truth) ----
@@ -72,8 +75,14 @@ Item {
 
   function reparseStatus() {
     try {
-      root.status = JSON.parse(statusFile.text())
+      var raw = statusFile.text()
+      if (!raw) return
+      var bytes = root.maxStatusBytes + 1
+      try { bytes = statusFile.data().byteLength } catch (e2) { bytes = raw.length * 3 }
+      if (bytes > root.maxStatusBytes) return
+      root.status = JSON.parse(raw)
       root.now = new Date()
+      root.maybeLaunchVerification()
     } catch (e) {
       // partially-written or missing file — keep the previous snapshot
     }
@@ -81,36 +90,80 @@ Item {
 
   FileView {
     id: statusFile
-    path: root.stateDir + "/status.json"
+    path: root.stateDir ? root.stateDir + "/status.json" : ""
     watchChanges: true
     onFileChanged: statusFile.reload()
     onLoaded: root.reparseStatus()
   }
 
-  // ---- helper process plumbing ----
+  // ---- pairing hand-off: the URL is built by the helper from the validated
+  //      user code + pinned app origin and re-validated here before launch.
+  //      Nothing from helper stdout is ever parsed.
+
+  property bool launchPending: false
+  property string launchPriorCode: ""
+  readonly property var verifyUrlPattern: /^https:\/\/app\.nowah\.xyz\/device\?code=[A-Z0-9]{4}-[A-Z0-9]{4}$/
+
+  function maybeLaunchVerification() {
+    if (!root.launchPending) return
+    if (root.authState !== "pairing" || !root.pairing) return
+    // Ignore a snapshot that still carries the previous pairing code.
+    if (String(root.pairing.userCode || "") === root.launchPriorCode) return
+    root.launchPending = false
+    var url = String(root.pairing.verificationUrl || "")
+    if (root.verifyUrlPattern.test(url))
+      Quickshell.execDetached(["omarchy-launch-webapp", url])
+  }
+
+  // ---- helper process plumbing (every run bounded + supervised) ----
 
   readonly property string syncBin: {
     var url = Qt.resolvedUrl("bin/nowah-sync").toString()
-    return url.indexOf("file://") === 0 ? url.substring(7) : url
+    var path = url.indexOf("file://") === 0 ? url.substring(7) : url
+    try { return decodeURIComponent(path) } catch (e) { return path }
   }
 
+  // Null entries are UNSET in the helper's environment: the developer
+  // override can only ever be engaged by hand, never inherited from the
+  // graphical session.
   readonly property var syncEnv: ({
-    NOWAH_API_URL: root.apiUrl,
-    NOWAH_SHOW_NOTIFICATIONS: root.showNotifications ? "1" : "0"
+    NOWAH_SHOW_NOTIFICATIONS: root.showNotifications ? "1" : "0",
+    NOWAH_DEV_API_ORIGIN: null,
+    NOWAH_DEV_CONSENT: null,
+    NOWAH_FLIGHT: null,
+    NOWAH_FLIGHT_DATE: null
   })
+
+  // Flight identity travels to the refresh run through its environment,
+  // never argv (a flight number reveals the user's travel to `ps`).
+  property var refreshEnv: root.syncEnv
+
+  // timeout(1) is the whole-tree deadline (TERM at 60s, KILL 5s later); the
+  // per-process watchdog Timers below are the in-shell backstop.
+  function helperCommand(args) {
+    return ["timeout", "-k", "5", "60", root.syncBin].concat(args)
+  }
+
+  readonly property int watchdogMs: 75000
 
   property double lastRefreshMs: 0
 
-  function currentFlightArgs() {
+  function currentFlightEnv() {
+    var env = {}
+    for (var k in root.syncEnv) env[k] = root.syncEnv[k]
     var m = root.monitor
-    if (!root.flightDay || !m || !m.seg || !m.seg.flight || !m.seg.flight.flightNumber) return []
-    return ["--flight", m.seg.flight.flightNumber, "--date", Model.localISODate(m.seg.dep)]
+    if (root.flightDay && m && m.seg && m.seg.flight && m.seg.flight.flightNumber) {
+      env.NOWAH_FLIGHT = String(m.seg.flight.flightNumber)
+      env.NOWAH_FLIGHT_DATE = Model.localISODate(m.seg.dep)
+    }
+    return env
   }
 
   function runRefresh() {
     if (refreshProc.running) return
     root.lastRefreshMs = Date.now()
-    refreshProc.command = [root.syncBin, "refresh"].concat(root.currentFlightArgs())
+    root.refreshEnv = root.currentFlightEnv()
+    refreshProc.command = root.helperCommand(["refresh"])
     refreshProc.running = true
   }
 
@@ -122,13 +175,16 @@ Item {
 
   function startPairing() {
     if (pairStartProc.running) return
-    pairStartProc.command = [root.syncBin, "pair-start"]
+    root.launchPriorCode = root.pairing ? String(root.pairing.userCode || "") : ""
+    root.launchPending = true
+    pairStartProc.command = root.helperCommand(["pair-start"])
     pairStartProc.running = true
   }
 
   function runDisconnect() {
     if (disconnectProc.running) return
-    disconnectProc.command = [root.syncBin, "disconnect"]
+    root.launchPending = false
+    disconnectProc.command = root.helperCommand(["disconnect"])
     disconnectProc.running = true
   }
 
@@ -141,35 +197,47 @@ Item {
 
   Process {
     id: refreshProc
-    environment: root.syncEnv
+    environment: root.refreshEnv
     onExited: statusFile.reload()
   }
+  Timer { interval: root.watchdogMs; running: refreshProc.running; onTriggered: refreshProc.running = false }
 
   Process {
     id: pairStartProc
     environment: root.syncEnv
-    onExited: statusFile.reload()
-    stdout: StdioCollector {
-      onStreamFinished: {
-        // pair-start prints verificationUriComplete on success only.
-        var url = String(text || "").trim()
-        if (url.indexOf("http") === 0)
-          Quickshell.execDetached(["omarchy-launch-webapp", url])
-      }
+    onExited: function(code) {
+      if (code !== 0) root.launchPending = false
+      statusFile.reload()
     }
   }
+  Timer { interval: root.watchdogMs; running: pairStartProc.running; onTriggered: pairStartProc.running = false }
 
   Process {
     id: pairPollProc
     environment: root.syncEnv
     // exit 10 = authorization pending; pairTimer simply polls again.
-    onExited: statusFile.reload()
+    // exit 0 after approval already ran a refresh inside the helper.
+    onExited: function(code) {
+      if (code === 0) root.lastRefreshMs = Date.now()
+      statusFile.reload()
+    }
   }
+  Timer { interval: root.watchdogMs; running: pairPollProc.running; onTriggered: pairPollProc.running = false }
 
   Process {
     id: disconnectProc
     environment: root.syncEnv
     onExited: statusFile.reload()
+  }
+  Timer { interval: root.watchdogMs; running: disconnectProc.running; onTriggered: disconnectProc.running = false }
+
+  // Replacement/destruction (hot reload, plugin disable) must not orphan a
+  // helper tree.
+  Component.onDestruction: {
+    refreshProc.running = false
+    pairStartProc.running = false
+    pairPollProc.running = false
+    disconnectProc.running = false
   }
 
   // ---- timers ----
@@ -193,12 +261,12 @@ Item {
 
   // Pairing poll at the server-suggested interval while the code is valid.
   Timer {
-    interval: (root.pairing && root.pairing.interval ? root.pairing.interval : 5) * 1000
+    interval: Math.min(60, Math.max(1, Number(root.pairing && root.pairing.interval) || 5)) * 1000
     running: root.pairingLive
     repeat: true
     onTriggered: {
       if (pairPollProc.running) return
-      pairPollProc.command = [root.syncBin, "pair-poll"]
+      pairPollProc.command = root.helperCommand(["pair-poll"])
       pairPollProc.running = true
     }
   }

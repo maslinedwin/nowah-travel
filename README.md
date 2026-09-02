@@ -30,7 +30,11 @@ Disconnect any time from the panel footer ("disconnect"), or revoke the device f
 ## Privacy & disclosure
 
 - **What is stored locally**: the read-only device token at `~/.local/state/nowah-omarchy/token` (file mode 600, directory 700), a transient `device.json` during pairing only, and the last sync snapshot in `status.json` (trip names/dates/flights — no secrets). Recent searches stay in the shell's own `shell.json` as before.
-- **Exact endpoints contacted** (all on `api.nowah.xyz`, or your configured API URL):
+- **Pinned origins**: the plugin talks only to `https://api.nowah.xyz` and opens only `https://app.nowah.xyz`. Neither is configurable from plugin settings, and the stored token is bound to that origin — a credential can never be presented to another host. (A developer override exists solely for hand-run testing: `NOWAH_DEV_API_ORIGIN` *and* `NOWAH_DEV_CONSENT=1` must both be set in the environment, and it uses a separate `nowah-omarchy-dev` state directory, so no production credential is ever reused.)
+- **Secrets never touch any command line**: the bearer header reaches `curl` through a private pipe descriptor (`-K /dev/fd/N`), request bodies through stdin, and secret material is fed to `jq` on stdin (never `--arg`), so nothing sensitive is visible in process metadata (`~/.curlrc` is ignored with `-q`). The helper validates the token format and the pairing code before use and builds the verification URL itself from the pinned app origin — a server-supplied URL is never launched. The pairing request identifies the client only as `"Omarchy"`; no hostname or machine identifier is sent. The current flight number for a flight-day status lookup is passed to the helper through its environment, not argv.
+- **Bounded everywhere**: responses are size-capped on the wire and on disk (512 KiB for trips, 32 KiB otherwise), kept in private files rather than shell variables, and reduced through a strict whitelist schema (≤25 trips, ≤12 flights per trip, bounded string lengths, flat weather) before anything reaches `status.json` (≤256 KiB, fail-closed). All API strings are stripped of markup and control characters and every panel `Text` renders as `Text.PlainText`, so nothing from the network is ever interpreted as rich text. Each helper run has a 40 s absolute deadline shared across all its requests, runs under `timeout -k 5 60`, is supervised by an in-shell watchdog, and stops on its own if its supervising shell process disappears; on plugin reload or disable any in-flight helper is signalled and in every case bounded to well under a minute. Helper runs are serialised with `flock`.
+- **Private state I/O**: the state directory must be a real directory we own (mode 700); every leaf is checked for type, owner, and no-symlink before use and published via `O_EXCL` temp file + rename. (Check-then-use in a shell is inherently racy, but only a same-UID process can race inside a 0700 directory we own — and that process already holds everything the token protects.)
+- **Exact endpoints contacted** (all on `https://api.nowah.xyz`):
   - `GET /trips` and `GET /notifications/unread-count` — authenticated with the device token
   - `GET /flights/:num/status` — public, flight-day only
   - `POST /device-auth/code` and `POST /device-auth/token` — during pairing only
@@ -41,7 +45,7 @@ Disconnect any time from the panel footer ("disconnect"), or revoke the device f
 ## Requirements
 
 - Omarchy 4.0 "Quattro" or later (the Quickshell-based shell with plugin support)
-- `curl` and `jq` (both ship with Omarchy) for the sync helper
+- `curl`, `jq`, and `flock` (util-linux) — all in the Omarchy base — for the sync helper
 
 ## Install
 
@@ -57,7 +61,7 @@ To remove:
 omarchy plugin remove xyz.nowah.travel
 ```
 
-Removing the plugin does not delete `~/.local/state/nowah-omarchy/` — run the panel's "disconnect" first (or delete the directory) if you want the token gone, and revoke the device in the app.
+Removing the plugin does not delete `~/.local/state/nowah-omarchy/` — run the panel's "disconnect" first (or delete the directory) if you want the token gone, and revoke the device in the app. A revoked or origin-mismatched token is deleted by the helper on its next run; a bare token written by v1.0.0 is migrated into the origin-bound format on first use.
 
 ## Usage
 
@@ -89,8 +93,6 @@ In **Setup > Plugins > Nowah**:
 | --- | --- | --- | --- |
 | `showRecent` | boolean | `true` | Recent searches as one-click pills |
 | `rotateExamples` | boolean | `true` | Rotating example queries in the placeholder |
-| `apiUrl` | string | `https://api.nowah.xyz` | API endpoint for the trip sync (staging: point this at your staging API) |
-| `appUrl` | string | `https://app.nowah.xyz` | Web app opened by searches and deep links |
 | `showNotifications` | boolean | `true` | Poll unread count; jade dot on the bar icon |
 | `countdownDays` | integer | `14` (1–60) | Show the bar countdown when departure is within this many days |
 
@@ -117,7 +119,7 @@ The state machine (`Model.js`) is a `.pragma library` port of the mobile app's w
 
 - **"Session expired — reconnect."** — the device token was revoked (from the app's security settings or server-side). Click **Connect Nowah** to pair again.
 - **Stale data marker** (small warning glyph next to UPCOMING TRIPS) — the last sync failed; the panel keeps showing the previous snapshot and retries on schedule, or use the `refresh` IPC call.
-- **Staging / self-hosted API** — set the `apiUrl` plugin setting; the sync helper also honors `NOWAH_API_URL` and `NOWAH_STATE_DIR` environment variables when run by hand.
+- **Testing against a staging API** — origins are pinned and not configurable from the plugin, and the plugin explicitly unsets the override variables for the helper. For hand-run helper testing only, export `NOWAH_DEV_API_ORIGIN=https://<staging-host>` together with `NOWAH_DEV_CONSENT=1`; the helper then uses a separate `~/.local/state/nowah-omarchy-dev/` directory (which the panel does not watch) and never reuses a production credential.
 - **Pairing code expired** — codes live 10 minutes; click "get new code" in the panel.
 
 ## License

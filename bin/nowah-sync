@@ -2,167 +2,445 @@
 #
 # nowah-sync — state synchronizer for the Nowah Omarchy plugin.
 #
-# Talks to the Nowah API (device-code pairing + read-only trip data) and
-# maintains an atomic JSON snapshot at $STATE_DIR/status.json which the
-# Quickshell side (NowahService.qml) watches. Secrets never appear on the
-# command line or in status.json: the bearer token lives in $STATE_DIR/token
-# (0600) and the pairing deviceCode in $STATE_DIR/device.json (0600).
+# Talks ONLY to the pinned Nowah production origin (device-code pairing +
+# read-only trip data) and maintains an atomic JSON snapshot at
+# $STATE_DIR/status.json which the Quickshell side (NowahService.qml) watches.
+#
+# Security posture (see README "Privacy & disclosure"):
+#   * Secrets never touch any argv: the bearer header travels to curl through
+#     a private pipe descriptor (-K /dev/fd/N), request bodies through stdin,
+#     and secret material is fed to jq on stdin (-R), never via --arg.
+#   * Credentials are bound to the pinned API origin. A developer override
+#     exists only via explicit env consent and uses a separate state dir, so
+#     a production token can never be replayed to another host.
+#   * Every response is size-capped on the wire and again on disk, kept in a
+#     private file (never a shell variable), and reduced through a strict
+#     whitelist/truncate/strip jq schema before anything reaches status.json.
+#   * State lives in a 0700 directory we own; every leaf is checked for
+#     type/owner/no-symlink before use and published via O_EXCL temp + rename.
+#     Runs are serialised with flock. (Check-then-use in bash is inherently
+#     racy, but only a same-UID actor can race inside a 0700 dir we own.)
+#   * One absolute deadline bounds the whole run; each curl gets the
+#     remaining budget; the helper stops if its supervising parent is gone.
 #
 # Subcommands:
-#   refresh [--flight NUM --date YYYY-MM-DD]   sync trips (+ optional extras)
-#   pair-start [clientName]                    begin pairing, print verify URL
-#   pair-poll                                  poll for approval (exit 10 = pending)
-#   disconnect                                 forget token + pairing
-#
-# API envelope: {success:true,data:{...}} | {success:false,error:{code,message}}.
+#   refresh          sync trips (NOWAH_FLIGHT / NOWAH_FLIGHT_DATE env add flight status)
+#   pair-start       begin pairing (verification URL lands in status.json)
+#   pair-poll        poll for approval (exit 10 = pending, poll again)
+#   disconnect       forget token + pairing
 
 set -euo pipefail
 umask 077
+export LC_ALL=C   # byte-accurate ${#var}, deterministic [A-Z] ranges and tr
 
-NOWAH_API_URL="${NOWAH_API_URL:-https://api.nowah.xyz}"
-NOWAH_APP_URL="${NOWAH_APP_URL:-https://app.nowah.xyz}"
+# ---------------------------------------------------------------------------
+# pinned origins + developer override
+# ---------------------------------------------------------------------------
+
+PROD_API_ORIGIN="https://api.nowah.xyz"
+API_ORIGIN="$PROD_API_ORIGIN"
+APP_ORIGIN="https://app.nowah.xyz"
+STATE_LEAF="nowah-omarchy"
+
+# Developer override: BOTH variables must be set by hand (the plugin never
+# sets them — it explicitly unsets them for the helper's environment). The
+# override forces its own state directory, so credentials issued by one
+# origin are never presented to another.
+if [[ -n "${NOWAH_DEV_API_ORIGIN:-}" ]]; then
+  if [[ "${NOWAH_DEV_CONSENT:-}" != "1" ]]; then
+    echo "nowah-sync: NOWAH_DEV_API_ORIGIN requires NOWAH_DEV_CONSENT=1" >&2
+    exit 2
+  fi
+  if [[ ! "$NOWAH_DEV_API_ORIGIN" =~ ^https://[a-z0-9.-]+(:[0-9]{1,5})?$ ]]; then
+    echo "nowah-sync: NOWAH_DEV_API_ORIGIN must be an https origin with no path" >&2
+    exit 2
+  fi
+  API_ORIGIN="$NOWAH_DEV_API_ORIGIN"
+  STATE_LEAF="nowah-omarchy-dev"
+fi
+
 NOWAH_SHOW_NOTIFICATIONS="${NOWAH_SHOW_NOTIFICATIONS:-0}"
-STATE_DIR="${NOWAH_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/nowah-omarchy}"
+
+# State base must be an absolute path; fall back to $HOME/.local/state.
+STATE_BASE="${XDG_STATE_HOME:-}"
+if [[ -z "$STATE_BASE" || "$STATE_BASE" != /* ]]; then
+  [[ -n "${HOME:-}" && "$HOME" == /* ]] || { echo "nowah-sync: HOME must be an absolute path" >&2; exit 2; }
+  STATE_BASE="$HOME/.local/state"
+fi
+STATE_DIR="$STATE_BASE/$STATE_LEAF"
 TOKEN_FILE="$STATE_DIR/token"
 DEVICE_FILE="$STATE_DIR/device.json"
 STATUS_FILE="$STATE_DIR/status.json"
-CODE_ENDPOINT="$NOWAH_API_URL/device-auth/code"
-TOKEN_ENDPOINT="$NOWAH_API_URL/device-auth/token"
-CURL_OPTS=(--silent --show-error --max-time 20)
+LOCK_FILE="$STATE_DIR/.lock"
 
 # ---------------------------------------------------------------------------
-# helpers
+# bounds
+# ---------------------------------------------------------------------------
+
+RUN_BUDGET_S=40                 # absolute deadline for the whole invocation
+DEADLINE=$((SECONDS + RUN_BUDGET_S))
+MAX_BODY_TRIPS=$((512 * 1024))  # bytes on the wire and on disk
+MAX_BODY_SMALL=$((32 * 1024))
+MAX_STATUS_BYTES=$((256 * 1024))
+MAX_SECRET_FILE=4096
+MAX_TRIPS=25
+MAX_FLIGHTS=12
+FLIGHT_STATUS_MAX_AGE_S=$((12 * 3600))
+PARENT_PID="$PPID"
+
+remaining() {
+  local r=$((DEADLINE - SECONDS))
+  (( r < 1 )) && r=0
+  printf '%s' "$r"
+}
+
+# Stop doing network work if our supervising parent (the shell's Process,
+# via timeout) is gone: reparented to init means we were orphaned.
+parent_alive() {
+  local ppid
+  ppid="$(cut -d' ' -f4 "/proc/$$/stat" 2>/dev/null || echo "$PARENT_PID")"
+  [[ "$ppid" == "$PARENT_PID" ]]
+}
+
+# ---------------------------------------------------------------------------
+# private state I/O
 # ---------------------------------------------------------------------------
 
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+die() { echo "nowah-sync: $*" >&2; exit 1; }
 
+# The 0700 directory we own is the security boundary; these checks make sure
+# it really is that, and refuse to operate on anything else.
 ensure_state_dir() {
-  mkdir -p "$STATE_DIR"
+  [[ -d "$STATE_BASE" ]] || mkdir -p "$STATE_BASE"
+  [[ ! -L "$STATE_BASE" ]] || die "state base is a symlink: $STATE_BASE"
+  [[ "$(stat -c %u "$STATE_BASE")" == "$(id -u)" ]] || die "state base not owned by us"
+  if [[ -L "$STATE_DIR" ]]; then die "state dir is a symlink: $STATE_DIR"; fi
+  if [[ ! -e "$STATE_DIR" ]]; then mkdir "$STATE_DIR"; fi
+  [[ -d "$STATE_DIR" ]] || die "state dir is not a directory: $STATE_DIR"
+  [[ "$(stat -c %u "$STATE_DIR")" == "$(id -u)" ]] || die "state dir not owned by us"
   chmod 700 "$STATE_DIR"
+  # Sweep temp leaves from runs that died long ago (never a live sibling's).
+  find "$STATE_DIR" -maxdepth 1 -name '.tmp.*' -type f -user "$(id -un)" -mmin +10 -delete 2>/dev/null || true
 }
 
-# Atomically replace STATUS_FILE with JSON read from stdin.
-commit_status() {
-  local tmp="$STATUS_FILE.tmp"
+# acquire_lock — serialise helper runs. Returns 1 if the lock is busy past
+# the remaining budget (callers decide whether that is retryable).
+acquire_lock() {
+  leaf_ok "$LOCK_FILE" || die "refusing non-regular lock leaf"
+  exec 9>"$LOCK_FILE"
+  chmod 600 "$LOCK_FILE"
+  flock -w "$(remaining)" 9
+}
+
+# leaf_ok PATH — true when PATH is absent or a regular, non-symlink file we own.
+leaf_ok() {
+  local p="$1"
+  [[ -e "$p" || -L "$p" ]] || return 0
+  [[ ! -L "$p" ]] || return 1
+  [[ -f "$p" ]] || return 1
+  [[ "$(stat -c %u "$p")" == "$(id -u)" ]] || return 1
+  return 0
+}
+
+# leaf_present PATH — true when PATH exists AND passes leaf_ok.
+leaf_present() {
+  local p="$1"
+  [[ -e "$p" ]] || return 1
+  leaf_ok "$p"
+}
+
+# safe_read PATH MAXBYTES — prints file content, bounded; fails when unusable.
+safe_read() {
+  local p="$1" max="$2"
+  leaf_present "$p" || return 1
+  local size
+  size="$(stat -c %s "$p")"
+  (( size <= max )) || return 1
+  head -c "$max" "$p"
+}
+
+# publish PATH — atomically replace PATH with stdin (O_EXCL temp + rename).
+publish() {
+  local target="$1" tmp
+  leaf_ok "$target" || die "refusing to replace non-regular leaf: $target"
+  tmp="$(mktemp "$STATE_DIR/.tmp.XXXXXXXX")"
   cat > "$tmp"
   chmod 600 "$tmp"
-  mv "$tmp" "$STATUS_FILE"
+  mv -T -f "$tmp" "$target"
 }
+
+# remove_leaf PATH — delete a state leaf (never follow links).
+remove_leaf() {
+  local p="$1"
+  [[ -e "$p" || -L "$p" ]] || return 0
+  if [[ -L "$p" ]] || [[ -f "$p" ]]; then rm -f "$p"; fi
+}
+
+# ---------------------------------------------------------------------------
+# strict schemas — the only path into status.json (also applied to carried
+# state from a previous snapshot, so legacy data can never bypass them)
+# ---------------------------------------------------------------------------
+
+# Shared jq prelude: bounded, markup/control-stripped strings; finite numbers.
+JQ_PRELUDE='
+  def s($n): if type == "string" then (gsub("[<>\\p{Cc}\\p{Cf}]"; "") | .[0:$n]) else null end;
+  def ident: if type == "string" and test("^[A-Za-z0-9_-]{1,64}$") then . else null end;
+  def dt: if type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}") then .[0:32] else null end;
+  def num: (if type == "number" then . else (tonumber? // null) end)
+           | if . == null then null elif (isinfinite or isnan or . > 1e9 or . < -1e9) then null else . end;
+'
+
+TRIP_LIST_SCHEMA="$JQ_PRELUDE"'
+  if type != "array" then [] else . end
+  | map(select(type == "object"))
+  | .[0:'"$MAX_TRIPS"']
+  | map({
+      id: (.id | ident),
+      name: (.name | s(80)),
+      status: (.status | s(32)),
+      tripStatus: (.tripStatus | s(32)),
+      startDate: (.startDate | dt),
+      endDate: (.endDate | dt),
+      dateRange: (if (.dateRange|type) == "object"
+                   then {start: (.dateRange.start | dt), end: (.dateRange.end | dt)}
+                   else null end),
+      destination: (.destination | s(80)),
+      destinationCity: (.destinationCity | s(60)),
+      destinationCountry: (.destinationCountry | s(60)),
+      weather: (if (.weather|type) == "object"
+                 then {temp: (.weather.temp | num), condition: (.weather.condition | s(40))}
+                 else null end),
+      flights: ((.flights // []) | if type != "array" then [] else . end
+                | map(select(type == "object"))
+                | .[0:'"$MAX_FLIGHTS"']
+                | map({
+                    flightNumber: (.flightNumber | s(12)),
+                    depCode: (.depCode | s(4)),
+                    arrCode: (.arrCode | s(4)),
+                    depAt: (.depAt | dt),
+                    arrAt: (.arrAt | dt)
+                  }))
+    })
+  | map(select(.id != null))
+'
+
+TRIPS_RESPONSE_SCHEMA='(.data.trips // []) | '"$TRIP_LIST_SCHEMA"
+
+# Public flight-status payload: top-level status/progress, nested delays/gate.
+FLIGHT_SCHEMA="$JQ_PRELUDE"'
+  (.data // {}) | if type != "object" then {} else . end
+  | {
+      status: ((.status // .flightStatus) | s(24)),
+      delayMinutes: ((.delayMinutes // .departureDelay // .delays.departure) | num),
+      progressPercent: ((.progressPercent // .progress) | num),
+      gate: ((.gate // .departureGate // .departure.gate) | s(8)),
+      terminal: ((.terminal // .departure.terminal) | s(8))
+    }
+'
+
+FLIGHT_CARRY_SCHEMA="$JQ_PRELUDE"'
+  if type != "object" then null else
+    { flightNumber: (.flightNumber | s(12)), fetchedAt: (.fetchedAt | dt),
+      data: ((.data // {}) | if type != "object" then {} else . end
+             | { status: (.status | s(24)), delayMinutes: (.delayMinutes | num),
+                 progressPercent: (.progressPercent | num), gate: (.gate | s(8)), terminal: (.terminal | s(8)) }) }
+  end
+'
 
 # Read a jq expression out of the existing status file (fallback when absent).
 prev() {
   local expr="$1" fallback="${2:-null}"
-  if [[ -f "$STATUS_FILE" ]]; then
+  if leaf_present "$STATUS_FILE" && (( $(stat -c %s "$STATUS_FILE") <= MAX_STATUS_BYTES )); then
     jq -c "$expr // $fallback" "$STATUS_FILE" 2>/dev/null || printf '%s' "$fallback"
   else
     printf '%s' "$fallback"
   fi
 }
 
-# write_status STATE AUTH_ERROR PAIRING PROFILE TRIPS UNREAD FLIGHTSTATUS OK SYNC_ERROR
-#   STATE:      signed_out | pairing | signed_in
-#   AUTH_ERROR: string, "" -> null
-#   PAIRING/PROFILE/TRIPS/UNREAD/FLIGHTSTATUS/OK: JSON values
-#   SYNC_ERROR: string, "" -> null
+prev_trips() { prev '.trips' '[]' | jq -c "$TRIP_LIST_SCHEMA" 2>/dev/null || printf '[]'; }
+prev_unread() { prev '.unreadCount' '0' | jq -c 'if type == "number" and . >= 0 and . <= 9999 then floor else 0 end' 2>/dev/null || printf '0'; }
+
+# prev_flight FLIGHTNUM — carried flight status only for the same flight and
+# only while fresh; anything else is dropped rather than shown stale.
+prev_flight() {
+  local want="$1"
+  [[ -n "$want" ]] || { printf 'null'; return; }
+  prev '.flightStatus' | jq -c "$FLIGHT_CARRY_SCHEMA" 2>/dev/null \
+    | jq -c --arg want "$want" --argjson maxAge "$FLIGHT_STATUS_MAX_AGE_S" '
+        if . == null or .flightNumber != $want or .fetchedAt == null then null
+        else ((.fetchedAt | try fromdateiso8601 catch 0) as $t
+              | if (now - $t) > $maxAge then null else . end) end' 2>/dev/null \
+    || printf 'null'
+}
+
+# write_status STATE AUTH_ERROR PAIRING TRIPS UNREAD FLIGHTSTATUS OK SYNC_ERROR
 write_status() {
-  jq -n \
+  local doc
+  doc="$(jq -cn \
     --arg at "$(now_iso)" \
     --arg state "$1" \
     --arg autherr "$2" \
     --argjson pairing "$3" \
-    --argjson profile "$4" \
-    --argjson trips "$5" \
-    --argjson unread "$6" \
-    --argjson flight "$7" \
-    --argjson ok "$8" \
-    --arg syncerr "$9" \
+    --argjson trips "$4" \
+    --argjson unread "$5" \
+    --argjson flight "$6" \
+    --argjson ok "$7" \
+    --arg syncerr "$8" \
     '{
       version: 1,
       generatedAt: $at,
       auth: {
         state: $state,
-        error: (if $autherr == "" then null else $autherr end),
+        error: (if $autherr == "" then null else $autherr[0:120] end),
         pairing: $pairing,
-        profile: $profile
+        profile: null
       },
       trips: $trips,
       unreadCount: $unread,
       flightStatus: $flight,
-      lastSync: {
-        ok: $ok,
-        at: $at,
-        error: (if $syncerr == "" then null else $syncerr end)
-      }
-    }' | commit_status
+      lastSync: { ok: $ok, at: $at, error: (if $syncerr == "" then null else $syncerr[0:120] end) }
+    }')"
+  if (( ${#doc} > MAX_STATUS_BYTES )); then
+    # Fail closed: never publish an oversized snapshot.
+    doc="$(jq -cn --arg at "$(now_iso)" --arg state "$1" \
+      '{version:1, generatedAt:$at, auth:{state:$state,error:null,pairing:null,profile:null},
+        trips:[], unreadCount:0, flightStatus:null,
+        lastSync:{ok:false, at:$at, error:"snapshot exceeded size limit"}}')"
+  fi
+  printf '%s\n' "$doc" | publish "$STATUS_FILE"
 }
 
 preflight() {
   local missing=""
   command -v curl >/dev/null 2>&1 || missing="curl"
   command -v jq >/dev/null 2>&1 || missing="${missing:+$missing }jq"
+  command -v flock >/dev/null 2>&1 || missing="${missing:+$missing }flock"
   if [[ -n "$missing" ]]; then
     ensure_state_dir
-    # jq itself may be what is missing — hand-roll the JSON.
-    local at tmp
+    local at
     at="$(now_iso)"
-    tmp="$STATUS_FILE.tmp"
     printf '{"version":1,"generatedAt":"%s","auth":{"state":"signed_out","error":"missing dependency: %s","pairing":null,"profile":null},"trips":[],"unreadCount":0,"flightStatus":null,"lastSync":{"ok":false,"at":"%s","error":"missing dependency: %s"}}\n' \
-      "$at" "$missing" "$at" "$missing" > "$tmp"
-    chmod 600 "$tmp"
-    mv "$tmp" "$STATUS_FILE"
-    echo "nowah-sync: missing dependency: $missing" >&2
-    exit 1
+      "$at" "$missing" "$at" "$missing" | publish "$STATUS_FILE"
+    die "missing dependency: $missing"
   fi
 }
 
-HTTP_CODE=""
-HTTP_BODY=""
+# ---------------------------------------------------------------------------
+# HTTP — bodies stay in a private file; secrets never enter any argv
+# ---------------------------------------------------------------------------
 
-# request METHOD URL [curl args…] — body in HTTP_BODY, status in HTTP_CODE.
-# Returns nonzero only on transport failure (HTTP_CODE becomes 000).
+HTTP_CODE=""
+HTTP_BODY_FILE=""
+
+cleanup_body() { [[ -n "$HTTP_BODY_FILE" ]] && rm -f "$HTTP_BODY_FILE"; HTTP_BODY_FILE=""; }
+trap cleanup_body EXIT
+
+# request URL MAXBYTES [BEARER] [JSON_BODY]
+#   Bearer header (if any) is delivered via a curl config on a private pipe
+#   descriptor; the JSON body (if any) via stdin (curl infers POST). Sets
+#   HTTP_CODE and leaves the (size-capped) body in HTTP_BODY_FILE. Nonzero
+#   return = transport failure, size overrun, or deadline exhausted ("000").
 request() {
-  local method="$1" url="$2"
-  shift 2
-  local tmp
-  tmp="$(mktemp "$STATE_DIR/.http.XXXXXX")"
-  if HTTP_CODE="$(curl "${CURL_OPTS[@]}" -X "$method" -o "$tmp" -w '%{http_code}' "$@" "$url" 2>/dev/null)"; then
-    :
-  else
-    HTTP_CODE="000"
+  local url="$1" max="$2" bearer="${3:-}" body="${4:-}"
+  cleanup_body
+  HTTP_CODE="000"
+  parent_alive || exit 143
+  local budget
+  budget="$(remaining)"
+  (( budget > 0 )) || return 1
+  HTTP_BODY_FILE="$(mktemp "$STATE_DIR/.tmp.XXXXXXXX")"
+
+  # -q FIRST: never read ~/.curlrc, which could alter TLS/proxy/redirect posture.
+  local -a args=(-q --silent
+                 --max-time "$budget" --connect-timeout 10
+                 --max-filesize "$max" --proto '=https' --tlsv1.2
+                 -o "$HTTP_BODY_FILE" -w '%{http_code} %{exitcode}')
+  local cfg=""
+  if [[ -n "$bearer" ]]; then
+    cfg="header = \"Authorization: Bearer ${bearer}\""
   fi
-  HTTP_BODY="$(cat "$tmp" 2>/dev/null || true)"
-  rm -f "$tmp"
+  if [[ -n "$body" ]]; then
+    args+=(-H 'Content-Type: application/json' --data-binary '@-')
+  fi
+
+  local out="" code="" rc=""
+  # fd 3 carries the config (header) through an anonymous pipe; stdin the body.
+  if [[ -n "$cfg" ]]; then
+    out="$(printf '%s' "$body" | curl "${args[@]}" -K /dev/fd/3 "$url" 3< <(printf '%s\n' "$cfg") 2>/dev/null)" || true
+  else
+    out="$(printf '%s' "$body" | curl "${args[@]}" "$url" 2>/dev/null)" || true
+  fi
+  code="${out%% *}"; rc="${out##* }"
+  [[ "$code" =~ ^[0-9]{3}$ ]] || code="000"
+  # Any curl-level failure (incl. --max-filesize overrun, rc 63) is a transport
+  # failure regardless of the HTTP status that came with it.
+  [[ "$rc" == "0" ]] || code="000"
+  if [[ -f "$HTTP_BODY_FILE" ]] && (( $(stat -c %s "$HTTP_BODY_FILE") > max )); then
+    : > "$HTTP_BODY_FILE"
+    code="000"
+  fi
+  HTTP_CODE="$code"
   [[ "$HTTP_CODE" != "000" ]]
 }
 
-# body_get EXPR FALLBACK — jq over HTTP_BODY, tolerating non-JSON bodies.
+# body_get EXPR FALLBACK — jq over the body file, tolerating non-JSON.
 body_get() {
   local expr="$1" fallback="${2:-null}"
-  printf '%s' "$HTTP_BODY" | jq -c "$expr // $fallback" 2>/dev/null || printf '%s' "$fallback"
+  [[ -n "$HTTP_BODY_FILE" && -s "$HTTP_BODY_FILE" ]] || { printf '%s' "$fallback"; return; }
+  jq -c "$expr // $fallback" "$HTTP_BODY_FILE" 2>/dev/null || printf '%s' "$fallback"
 }
 
 # body_str EXPR — like body_get but unwraps a JSON string ("" when absent).
-body_str() {
-  body_get "$1" '""' | jq -r .
+body_str() { body_get "$1" '""' | jq -r . 2>/dev/null || true; }
+
+# ---------------------------------------------------------------------------
+# credential handling (secret material only ever flows through pipes)
+# ---------------------------------------------------------------------------
+
+TOKEN_RE='^nowah_dev_[A-Za-z0-9_-]{20,128}$'
+
+# load_token — prints the bearer token bound to API_ORIGIN, or fails.
+#   A bare-string token written by v1.0.0 is migrated into the bound format
+#   (production origin only); anything else that does not match is removed.
+load_token() {
+  local raw origin token
+  raw="$(safe_read "$TOKEN_FILE" "$MAX_SECRET_FILE")" || return 1
+  raw="${raw%$'\n'}"
+  if [[ "$raw" =~ $TOKEN_RE ]]; then
+    [[ "$API_ORIGIN" == "$PROD_API_ORIGIN" ]] || { remove_leaf "$TOKEN_FILE"; return 1; }
+    store_token "$raw" || return 1
+    printf '%s' "$raw"
+    return 0
+  fi
+  origin="$(printf '%s' "$raw" | jq -r '.origin // empty' 2>/dev/null || true)"
+  token="$(printf '%s' "$raw" | jq -r '.token // empty' 2>/dev/null || true)"
+  if [[ "$origin" != "$API_ORIGIN" || ! "$token" =~ $TOKEN_RE ]]; then
+    remove_leaf "$TOKEN_FILE"
+    return 1
+  fi
+  printf '%s' "$token"
+}
+
+store_token() {
+  local token="$1"
+  [[ "$token" =~ $TOKEN_RE ]] || return 1
+  printf '%s' "$token" | jq -Rc --arg origin "$API_ORIGIN" '{origin: $origin, token: .}' | publish "$TOKEN_FILE"
 }
 
 # ---------------------------------------------------------------------------
-# refresh [--flight NUM --date YYYY-MM-DD]
+# refresh — flight lookup driven by NOWAH_FLIGHT / NOWAH_FLIGHT_DATE env
+#           (never argv: a flight number identifies the user's travel)
 # ---------------------------------------------------------------------------
 
 cmd_refresh() {
-  local flight_num="" flight_date=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --flight) flight_num="${2:-}"; shift 2 ;;
-      --date) flight_date="${2:-}"; shift 2 ;;
-      *) shift ;;
-    esac
-  done
+  local flight_num="${NOWAH_FLIGHT:-}" flight_date="${NOWAH_FLIGHT_DATE:-}"
+  flight_num="${flight_num// /}"
+  [[ "$flight_num" =~ ^[A-Z0-9]{2,8}$ ]] || flight_num=""
+  [[ "$flight_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || flight_date=""
 
-  ensure_state_dir
-
-  if [[ ! -f "$TOKEN_FILE" ]]; then
+  local token=""
+  if ! token="$(load_token)"; then
     # Not signed in. Never clobber an in-flight pairing (or the auth error
     # explaining why we are signed out) — pair-start/pair-poll own those.
     local pairing autherr state exp
@@ -171,137 +449,115 @@ cmd_refresh() {
     state="signed_out"
     if [[ "$pairing" != "null" ]]; then
       exp="$(printf '%s' "$pairing" | jq -r '.expiresAt // empty')"
-      if [[ -n "$exp" ]] && [[ "$(date -u -d "$exp" +%s 2>/dev/null || echo 0)" -gt "$(date -u +%s)" ]]; then
+      if [[ "$exp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$ ]] \
+         && [[ "$(date -u -d "$exp" +%s 2>/dev/null || echo 0)" -gt "$(date -u +%s)" ]]; then
         state="pairing"
       else
         pairing="null"
       fi
     fi
-    write_status "$state" "$autherr" "$pairing" null '[]' 0 null true ""
+    write_status "$state" "$autherr" "$pairing" '[]' 0 null true ""
     return 0
   fi
 
-  local token
-  token="$(cat "$TOKEN_FILE")"
-
-  local prev_trips prev_unread prev_flight profile
-  prev_trips="$(prev '.trips' '[]')"
-  prev_unread="$(prev '.unreadCount' '0')"
-  prev_flight="$(prev '.flightStatus')"
-  profile="$(prev '.auth.profile')"
+  local carried_trips carried_unread carried_flight
+  carried_trips="$(prev_trips)"
+  carried_unread="$(prev_unread)"
+  carried_flight="$(prev_flight "$flight_num")"
 
   # --- trips ---
-  if ! request GET "$NOWAH_API_URL/trips?limit=25" -H "Authorization: Bearer $token"; then
-    write_status "signed_in" "" null "$profile" "$prev_trips" "$prev_unread" "$prev_flight" false "network error"
+  if ! request "$API_ORIGIN/trips?limit=$MAX_TRIPS" "$MAX_BODY_TRIPS" "$token"; then
+    write_status "signed_in" "" null "$carried_trips" "$carried_unread" "$carried_flight" false "network error"
     return 0
   fi
-
   case "$HTTP_CODE" in
     401|403)
-      # Token revoked server-side. Keep the file around for debugging, but
-      # out of the way so refresh flips to the connect state.
-      mv -f "$TOKEN_FILE" "$TOKEN_FILE.revoked"
-      write_status "signed_out" "revoked" null null '[]' 0 null true ""
+      remove_leaf "$TOKEN_FILE"
+      write_status "signed_out" "revoked" null '[]' 0 null true ""
       return 0
       ;;
     5??)
-      write_status "signed_in" "" null "$profile" "$prev_trips" "$prev_unread" "$prev_flight" false "server error ($HTTP_CODE)"
+      write_status "signed_in" "" null "$carried_trips" "$carried_unread" "$carried_flight" false "server error ($HTTP_CODE)"
       return 0
       ;;
   esac
-
   if [[ "$(body_get '.success' 'false')" != "true" ]]; then
     local msg
     msg="$(body_str '.error.message')"
-    write_status "signed_in" "" null "$profile" "$prev_trips" "$prev_unread" "$prev_flight" false "${msg:-sync failed}"
+    write_status "signed_in" "" null "$carried_trips" "$carried_unread" "$carried_flight" false "${msg:-sync failed}"
     return 0
   fi
-
   local trips
-  trips="$(body_get '.data.trips' '[]')"
+  trips="$(jq -c "$TRIPS_RESPONSE_SCHEMA" "$HTTP_BODY_FILE" 2>/dev/null || printf '[]')"
 
   # --- unread notifications (optional) ---
-  local unread="$prev_unread"
+  local unread="$carried_unread"
   if [[ "$NOWAH_SHOW_NOTIFICATIONS" == "1" ]]; then
-    if request GET "$NOWAH_API_URL/notifications/unread-count" -H "Authorization: Bearer $token" \
+    if request "$API_ORIGIN/notifications/unread-count" "$MAX_BODY_SMALL" "$token" \
         && [[ "$HTTP_CODE" == "200" ]]; then
-      unread="$(body_get '.data.count' "$prev_unread")"
+      unread="$(body_get '(.data.count | if type == "number" then (floor | if . < 0 then 0 elif . > 9999 then 9999 else . end) else null end)' "$carried_unread")"
     fi
   fi
 
-  # --- public flight status (optional, no auth) ---
-  local flight_status="$prev_flight"
+  # --- public flight status (optional, no auth, strictly validated inputs) ---
+  local flight_status="$carried_flight"
   if [[ -n "$flight_num" ]]; then
-    flight_num="${flight_num// /}" # compact: "NH 106" -> "NH106"
-    local url="$NOWAH_API_URL/flights/$flight_num/status"
+    local url="$API_ORIGIN/flights/$flight_num/status"
     [[ -n "$flight_date" ]] && url="$url?date=$flight_date"
-    if request GET "$url" && [[ "$HTTP_CODE" == "200" ]] \
+    if request "$url" "$MAX_BODY_SMALL" && [[ "$HTTP_CODE" == "200" ]] \
         && [[ "$(body_get '.success' 'false')" == "true" ]]; then
-      flight_status="$(jq -cn \
-        --arg num "$flight_num" \
-        --arg at "$(now_iso)" \
-        --argjson data "$(body_get '.data' '{}')" \
+      flight_status="$(jq -cn --arg num "$flight_num" --arg at "$(now_iso)" \
+        --argjson data "$(jq -c "$FLIGHT_SCHEMA" "$HTTP_BODY_FILE" 2>/dev/null || printf '{}')" \
         '{flightNumber: $num, fetchedAt: $at, data: $data}')"
     fi
   fi
 
-  write_status "signed_in" "" null "$profile" "$trips" "$unread" "$flight_status" true ""
+  # A disconnect cannot interleave (flock), but never publish signed_in
+  # unless the credential is still on disk.
+  leaf_present "$TOKEN_FILE" || { write_status "signed_out" "" null '[]' 0 null true ""; return 0; }
+  write_status "signed_in" "" null "$trips" "$unread" "$flight_status" true ""
 }
 
 # ---------------------------------------------------------------------------
-# pair-start [clientName]
+# pair-start
 # ---------------------------------------------------------------------------
 
 cmd_pair_start() {
-  ensure_state_dir
-  local client_name="${1:-Omarchy ($(hostname 2>/dev/null || echo linux))}"
-
-  local req
-  req="$(jq -cn --arg clientName "$client_name" '{clientName: $clientName}')"
-  if ! request POST "$CODE_ENDPOINT" -H 'Content-Type: application/json' --data "$req"; then
-    write_status "signed_out" "network error" null "$(prev '.auth.profile')" \
-      "$(prev '.trips' '[]')" "$(prev '.unreadCount' '0')" "$(prev '.flightStatus')" false "network error"
-    echo "nowah-sync: pairing request failed (network)" >&2
-    return 1
+  # No hostname or other machine identifiers leave the device.
+  local req='{"clientName":"Omarchy"}'
+  if ! request "$API_ORIGIN/device-auth/code" "$MAX_BODY_SMALL" "" "$req"; then
+    write_status "signed_out" "network error" null "$(prev_trips)" "$(prev_unread)" null false "network error"
+    die "pairing request failed (network)"
   fi
-
   if [[ "$(body_get '.success' 'false')" != "true" ]]; then
     local msg
-    msg="$(body_str '.error.message')"
-    msg="${msg:-pairing failed}"
-    write_status "signed_out" "$msg" null "$(prev '.auth.profile')" \
-      "$(prev '.trips' '[]')" "$(prev '.unreadCount' '0')" "$(prev '.flightStatus')" false "$msg"
-    echo "nowah-sync: pairing request failed: $msg" >&2
-    return 1
+    msg="$(body_str '.error.message')"; msg="${msg:-pairing failed}"
+    write_status "signed_out" "$msg" null "$(prev_trips)" "$(prev_unread)" null false "$msg"
+    die "pairing request failed: $msg"
   fi
 
-  local device_code user_code verify_url expires_in interval expires_at
-  device_code="$(body_str '.data.deviceCode')"
-  user_code="$(body_str '.data.userCode')"
-  verify_url="$(body_str '.data.verificationUriComplete')"
-  [[ -n "$verify_url" ]] || verify_url="$(body_str '.data.verificationUri')"
-  expires_in="$(body_get '.data.expiresIn' '600')"
-  interval="$(body_get '.data.interval' '5')"
+  local user_code expires_in interval expires_at
+  user_code="$(body_str '.data.userCode' | tr -cd 'A-Z0-9-' | head -c 9)"
+  expires_in="$(body_get '(.data.expiresIn | if type == "number" and . > 0 and . <= 3600 then floor else 600 end)' '600')"
+  interval="$(body_get '(.data.interval | if type == "number" and . >= 1 and . <= 60 then floor else 5 end)' '5')"
+  [[ "$user_code" =~ ^[A-Z0-9]{4}-[A-Z0-9]{4}$ ]] || die "malformed user code from server"
   expires_at="$(date -u -d "+${expires_in} seconds" +%Y-%m-%dT%H:%M:%SZ)"
 
-  # deviceCode is a credential: 0600 device.json only, NEVER status.json.
-  local tmp="$DEVICE_FILE.tmp"
-  jq -cn --arg deviceCode "$device_code" --arg expiresAt "$expires_at" \
-    '{deviceCode: $deviceCode, expiresAt: $expiresAt}' > "$tmp"
-  chmod 600 "$tmp"
-  mv "$tmp" "$DEVICE_FILE"
+  # deviceCode is a credential: it flows body-file → jq(stdin) → 0600
+  # device.json, never through a shell variable or argv, and NEVER status.json.
+  local device_ok
+  device_ok="$(jq -r '.data.deviceCode | if type == "string" and test("^[a-f0-9]{64}$") then "ok" else "bad" end' "$HTTP_BODY_FILE" 2>/dev/null || echo bad)"
+  [[ "$device_ok" == "ok" ]] || die "malformed device code from server"
+  jq -c --arg expiresAt "$expires_at" '{deviceCode: .data.deviceCode, expiresAt: $expiresAt}' "$HTTP_BODY_FILE" | publish "$DEVICE_FILE"
 
+  # The verification URL is built locally from the validated code and the
+  # pinned app origin — a server-supplied URL is never launched.
+  local verify_url="$APP_ORIGIN/device?code=$user_code"
   local pairing
-  pairing="$(jq -cn \
-    --arg userCode "$user_code" \
-    --arg verificationUrl "$verify_url" \
-    --arg expiresAt "$expires_at" \
-    --argjson interval "$interval" \
+  pairing="$(jq -cn --arg userCode "$user_code" --arg verificationUrl "$verify_url" \
+    --arg expiresAt "$expires_at" --argjson interval "$interval" \
     '{userCode: $userCode, verificationUrl: $verificationUrl, expiresAt: $expiresAt, interval: $interval}')"
-  write_status "pairing" "" "$pairing" "$(prev '.auth.profile')" \
-    "$(prev '.trips' '[]')" "$(prev '.unreadCount' '0')" "$(prev '.flightStatus')" true ""
-
-  printf '%s\n' "$verify_url"
+  write_status "pairing" "" "$pairing" "$(prev_trips)" "$(prev_unread)" null true ""
 }
 
 # ---------------------------------------------------------------------------
@@ -309,57 +565,49 @@ cmd_pair_start() {
 # ---------------------------------------------------------------------------
 
 cmd_pair_poll() {
-  ensure_state_dir
-
-  if [[ ! -f "$DEVICE_FILE" ]]; then
-    write_status "signed_out" "" null null '[]' 0 null true ""
-    return 1
-  fi
-  local device_code
-  device_code="$(jq -r '.deviceCode // empty' "$DEVICE_FILE" 2>/dev/null || true)"
-  if [[ -z "$device_code" ]]; then
-    rm -f "$DEVICE_FILE"
-    write_status "signed_out" "" null null '[]' 0 null true ""
+  local device_ok
+  device_ok="$(safe_read "$DEVICE_FILE" "$MAX_SECRET_FILE" \
+    | jq -r '.deviceCode | if type == "string" and test("^[a-f0-9]{64}$") then "ok" else "bad" end' 2>/dev/null || echo bad)"
+  if [[ "$device_ok" != "ok" ]]; then
+    remove_leaf "$DEVICE_FILE"
+    write_status "signed_out" "" null '[]' 0 null true ""
     return 1
   fi
 
+  # Request body built from the device file on stdin — the code never enters
+  # a shell variable or any argv.
   local req
-  req="$(jq -cn --arg deviceCode "$device_code" '{deviceCode: $deviceCode}')"
-  if ! request POST "$TOKEN_ENDPOINT" -H 'Content-Type: application/json' --data "$req"; then
+  req="$(safe_read "$DEVICE_FILE" "$MAX_SECRET_FILE" | jq -c '{deviceCode: .deviceCode}')"
+  if ! request "$API_ORIGIN/device-auth/token" "$MAX_BODY_SMALL" "" "$req"; then
     return 10 # transient network problem — keep polling
   fi
 
   if [[ "$(body_get '.success' 'false')" == "true" ]]; then
-    local token tmp
+    local token
     token="$(body_str '.data.token')"
-    [[ -n "$token" ]] || return 10
-    tmp="$TOKEN_FILE.tmp"
-    printf '%s' "$token" > "$tmp"
-    chmod 600 "$tmp"
-    mv "$tmp" "$TOKEN_FILE"
-    rm -f "$DEVICE_FILE"
-    exec "$0" refresh
+    if ! store_token "$token"; then
+      # The grant was consumed server-side but the token is unusable: fail
+      # closed rather than poll a redeemed code forever.
+      remove_leaf "$DEVICE_FILE"
+      write_status "signed_out" "pairing failed" null '[]' 0 null true ""
+      return 0
+    fi
+    remove_leaf "$DEVICE_FILE"
+    cmd_refresh
+    return 0
   fi
 
-  local code
-  code="$(body_str '.error.code')"
-  case "$code" in
-    authorization_pending|slow_down)
-      return 10
-      ;;
+  case "$(body_str '.error.code')" in
+    authorization_pending|slow_down) return 10 ;;
     expired_token)
-      rm -f "$DEVICE_FILE"
-      write_status "signed_out" "expired" null null '[]' 0 null true ""
-      return 0
-      ;;
+      remove_leaf "$DEVICE_FILE"
+      write_status "signed_out" "expired" null '[]' 0 null true ""
+      return 0 ;;
     access_denied)
-      rm -f "$DEVICE_FILE"
-      write_status "signed_out" "denied" null null '[]' 0 null true ""
-      return 0
-      ;;
-    *)
-      return 10 # unknown transient response — keep polling until expiry
-      ;;
+      remove_leaf "$DEVICE_FILE"
+      write_status "signed_out" "denied" null '[]' 0 null true ""
+      return 0 ;;
+    *) return 10 ;;
   esac
 }
 
@@ -368,26 +616,33 @@ cmd_pair_poll() {
 # ---------------------------------------------------------------------------
 
 cmd_disconnect() {
-  ensure_state_dir
-  rm -f "$TOKEN_FILE" "$DEVICE_FILE"
-  write_status "signed_out" "" null null '[]' 0 null true ""
+  remove_leaf "$TOKEN_FILE"
+  remove_leaf "$DEVICE_FILE"
+  write_status "signed_out" "" null '[]' 0 null true ""
 }
 
 # ---------------------------------------------------------------------------
 
 main() {
   preflight
+  ensure_state_dir
   local cmd="${1:-refresh}"
-  shift || true
   case "$cmd" in
-    refresh) cmd_refresh "$@" ;;
-    pair-start) cmd_pair_start "$@" ;;
+    refresh|pair-start|pair-poll|disconnect) ;;
+    *)
+      echo "usage: nowah-sync {refresh | pair-start | pair-poll | disconnect}" >&2
+      return 2 ;;
+  esac
+  if ! acquire_lock; then
+    # Another helper run owns the state right now.
+    [[ "$cmd" == "pair-poll" ]] && return 10
+    return 0
+  fi
+  case "$cmd" in
+    refresh) cmd_refresh ;;
+    pair-start) cmd_pair_start ;;
     pair-poll) cmd_pair_poll ;;
     disconnect) cmd_disconnect ;;
-    *)
-      echo "usage: nowah-sync {refresh [--flight NUM --date YYYY-MM-DD] | pair-start [clientName] | pair-poll | disconnect}" >&2
-      return 2
-      ;;
   esac
 }
 

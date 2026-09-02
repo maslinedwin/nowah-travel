@@ -175,6 +175,8 @@ Panel {
           spacing: Style.space(6)
 
           Text {
+
+            textFormat: Text.PlainText
             anchors.verticalCenter: parent.verticalCenter
             text: "\uf072"
             color: root.accent
@@ -183,6 +185,8 @@ Panel {
           }
 
           Text {
+
+            textFormat: Text.PlainText
             anchors.verticalCenter: parent.verticalCenter
             text: "Nowah"
             color: root.dim
@@ -194,6 +198,8 @@ Panel {
         }
 
         Text {
+
+          textFormat: Text.PlainText
           text: "Where to?"
           color: root.fg
           font.family: root.fontFamily
@@ -214,6 +220,8 @@ Panel {
           Behavior on border.color { ColorAnimation { duration: 140 } }
 
           Text {
+
+            textFormat: Text.PlainText
             id: searchGlyph
             anchors.left: parent.left
             anchors.leftMargin: Style.space(12)
@@ -251,6 +259,8 @@ Panel {
             }
 
             Text {
+
+              textFormat: Text.PlainText
               id: placeholderText
               anchors.fill: parent
               verticalAlignment: Text.AlignVCenter
@@ -277,6 +287,8 @@ Panel {
             Behavior on color { ColorAnimation { duration: 120 } }
 
             Text {
+
+              textFormat: Text.PlainText
               id: enterLabel
               anchors.centerIn: parent
               text: "Search ↵"
@@ -335,6 +347,8 @@ Panel {
             spacing: Style.space(8)
 
             Text {
+
+              textFormat: Text.PlainText
               width: parent.width
               text: NowahService.authError === "revoked"
                 ? "Session expired — reconnect."
@@ -356,6 +370,8 @@ Panel {
               Behavior on scale { NumberAnimation { duration: 90; easing.type: Easing.OutQuad } }
 
               Text {
+
+                textFormat: Text.PlainText
                 id: connectLabel
                 anchors.centerIn: parent
                 text: "Connect Nowah"
@@ -405,6 +421,8 @@ Panel {
             spacing: Style.space(6)
 
             Text {
+
+              textFormat: Text.PlainText
               text: NowahService.pairing && NowahService.pairing.userCode
                 ? NowahService.pairing.userCode
                 : "· · · ·"
@@ -416,6 +434,8 @@ Panel {
             }
 
             Text {
+
+              textFormat: Text.PlainText
               width: parent.width
               text: "Approve in the Nowah window — check the code matches"
               color: root.dim
@@ -428,6 +448,8 @@ Panel {
               spacing: Style.space(12)
 
               Text {
+
+                textFormat: Text.PlainText
                 text: {
                   if (pairingCard.expired) return "code expired"
                   var s = Math.floor(pairingCard.msLeft / 1000)
@@ -439,6 +461,8 @@ Panel {
               }
 
               Text {
+
+                textFormat: Text.PlainText
                 visible: pairingCard.expired
                 text: "get new code"
                 color: newCodeMouse.containsMouse ? root.fg : Model.BRAND.jadeText
@@ -457,6 +481,8 @@ Panel {
               }
 
               Text {
+
+                textFormat: Text.PlainText
                 text: "cancel"
                 color: cancelMouse.containsMouse ? root.fg : root.dim
                 font.family: root.fontFamily
@@ -513,6 +539,8 @@ Panel {
               spacing: Style.space(6)
 
               Text {
+
+                textFormat: Text.PlainText
                 id: upcomingLabel
                 text: "Upcoming trips"
                 color: root.dim
@@ -523,6 +551,8 @@ Panel {
               }
 
               Text {
+
+                textFormat: Text.PlainText
                 visible: NowahService.stale
                 anchors.verticalCenter: parent.verticalCenter
                 text: "\uf071"
@@ -552,6 +582,8 @@ Panel {
                 spacing: Style.space(4)
 
                 Text {
+
+                  textFormat: Text.PlainText
                   text: "\uf0f3"
                   color: Model.BRAND.jadeText
                   font.family: root.iconFamily
@@ -559,6 +591,8 @@ Panel {
                 }
 
                 Text {
+
+                  textFormat: Text.PlainText
                   text: String(NowahService.unreadCount)
                   color: Model.BRAND.jadeText
                   font.family: root.fontFamily
@@ -615,6 +649,8 @@ Panel {
                 height: heroCity.implicitHeight
 
                 Text {
+
+                  textFormat: Text.PlainText
                   id: heroCity
                   anchors.left: parent.left
                   anchors.right: heroWeather.visible ? heroWeather.left : parent.right
@@ -638,6 +674,8 @@ Panel {
                   spacing: Style.space(4)
 
                   Text {
+
+                    textFormat: Text.PlainText
                     text: Model.weatherGlyph(root.weatherCondition(tripsSection.heroTrip))
                     color: root.dim
                     font.family: root.iconFamily
@@ -645,6 +683,8 @@ Panel {
                   }
 
                   Text {
+
+                    textFormat: Text.PlainText
                     visible: text !== ""
                     text: root.weatherTemp(tripsSection.heroTrip)
                     color: root.dim
@@ -655,6 +695,8 @@ Panel {
               }
 
               Text {
+
+                textFormat: Text.PlainText
                 visible: text !== ""
                 text: tripsSection.heroTrip ? (tripsSection.heroTrip.destinationCountry || "") : ""
                 color: root.dim
@@ -666,6 +708,8 @@ Panel {
                 spacing: Style.space(8)
 
                 Text {
+
+                  textFormat: Text.PlainText
                   anchors.verticalCenter: parent.verticalCenter
                   text: Model.tripDateRange(tripsSection.heroTrip)
                   color: root.dim
@@ -682,6 +726,8 @@ Panel {
                   color: Qt.alpha(Model.BRAND.jade, 0.16)
 
                   Text {
+
+                    textFormat: Text.PlainText
                     id: heroChip
                     anchors.centerIn: parent
                     text: NowahService.monitor && NowahService.monitor.state === "in_destination"
@@ -710,6 +756,8 @@ Panel {
                 spacing: Style.space(10)
 
                 Text {
+
+                  textFormat: Text.PlainText
                   anchors.verticalCenter: parent.verticalCenter
                   text: NowahService.heroCard ? NowahService.heroCard.flightNumber : ""
                   color: root.fg
@@ -723,6 +771,8 @@ Panel {
                   spacing: Style.space(6)
 
                   Text {
+
+                    textFormat: Text.PlainText
                     text: NowahService.heroCard ? NowahService.heroCard.depCode : ""
                     color: root.fg
                     font.family: root.fontFamily
@@ -730,6 +780,8 @@ Panel {
                   }
 
                   Text {
+
+                    textFormat: Text.PlainText
                     anchors.verticalCenter: parent.verticalCenter
                     text: "\uf178"
                     color: root.dim
@@ -738,6 +790,8 @@ Panel {
                   }
 
                   Text {
+
+                    textFormat: Text.PlainText
                     text: NowahService.heroCard ? NowahService.heroCard.arrCode : ""
                     color: root.fg
                     font.family: root.fontFamily
@@ -758,6 +812,8 @@ Panel {
                 }
 
                 Text {
+
+                  textFormat: Text.PlainText
                   anchors.verticalCenter: parent.verticalCenter
                   text: root.flightHeroLabel()
                   color: root.dim
@@ -773,7 +829,7 @@ Panel {
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
               onClicked: {
-                if (tripsSection.heroTrip) root.launch("/trips/" + tripsSection.heroTrip.id)
+                if (tripsSection.heroTrip) root.launch("/trips/" + encodeURIComponent(String(tripsSection.heroTrip.id)))
               }
             }
           }
@@ -797,6 +853,8 @@ Panel {
               Behavior on color { ColorAnimation { duration: 120 } }
 
               Text {
+
+                textFormat: Text.PlainText
                 id: rowCity
                 anchors.left: parent.left
                 anchors.leftMargin: Style.space(8)
@@ -814,6 +872,8 @@ Panel {
               }
 
               Text {
+
+                textFormat: Text.PlainText
                 id: rowChip
                 anchors.right: parent.right
                 anchors.rightMargin: Style.space(8)
@@ -829,13 +889,14 @@ Panel {
                 anchors.fill: parent
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
-                onClicked: root.launch("/trips/" + tripRow.modelData.id)
+                onClicked: root.launch("/trips/" + encodeURIComponent(String(tripRow.modelData.id)))
               }
             }
           }
 
           // all trips link
           Text {
+            textFormat: Text.PlainText
             visible: tripsSection.heroTrip !== null
             text: "All trips →"
             color: allTripsMouse.containsMouse ? root.accent : root.dim
@@ -859,6 +920,8 @@ Panel {
             spacing: Style.space(8)
 
             Text {
+
+              textFormat: Text.PlainText
               text: "No upcoming trips"
               color: root.dim
               font.family: root.fontFamily
@@ -866,6 +929,8 @@ Panel {
             }
 
             Text {
+
+              textFormat: Text.PlainText
               text: "Plan one →"
               color: planOneMouse.containsMouse ? root.fg : Model.BRAND.jadeText
               font.family: root.fontFamily
@@ -889,6 +954,8 @@ Panel {
             spacing: 0
 
             Text {
+
+              textFormat: Text.PlainText
               id: connectedAs
               width: Math.min(implicitWidth, tripsSection.width - footerSep.implicitWidth - disconnectLink.implicitWidth)
               text: NowahService.profile && NowahService.profile.email
@@ -901,6 +968,8 @@ Panel {
             }
 
             Text {
+
+              textFormat: Text.PlainText
               id: footerSep
               text: "  ·  "
               color: root.dim
@@ -909,6 +978,8 @@ Panel {
             }
 
             Text {
+
+              textFormat: Text.PlainText
               id: disconnectLink
               text: "disconnect"
               color: disconnectMouse.containsMouse ? root.fg : root.dim
@@ -960,6 +1031,8 @@ Panel {
                 spacing: Style.space(4)
 
                 Text {
+
+                  textFormat: Text.PlainText
                   anchors.horizontalCenter: parent.horizontalCenter
                   text: tile.modelData.icon
                   color: tileMouse.containsMouse ? root.accent : root.fg
@@ -970,6 +1043,8 @@ Panel {
                 }
 
                 Text {
+
+                  textFormat: Text.PlainText
                   anchors.horizontalCenter: parent.horizontalCenter
                   text: tile.modelData.label
                   color: tileMouse.containsMouse ? root.fg : root.dim
@@ -1004,6 +1079,8 @@ Panel {
             height: recentLabel.implicitHeight
 
             Text {
+
+              textFormat: Text.PlainText
               id: recentLabel
               anchors.left: parent.left
               text: "Recent"
@@ -1015,6 +1092,8 @@ Panel {
             }
 
             Text {
+
+              textFormat: Text.PlainText
               anchors.right: parent.right
               text: "clear"
               color: clearMouse.containsMouse ? root.accent : root.dim
@@ -1054,6 +1133,8 @@ Panel {
                 Behavior on border.color { ColorAnimation { duration: 120 } }
 
                 Text {
+
+                  textFormat: Text.PlainText
                   id: recentText
                   anchors.centerIn: parent
                   width: Math.min(implicitWidth, recentPill.width - Style.space(14))
@@ -1079,6 +1160,8 @@ Panel {
         }
 
         Text {
+
+          textFormat: Text.PlainText
           width: parent.width
           text: "→ use suggestion  ·  ↵ search  ·  esc close"
           color: root.dim
