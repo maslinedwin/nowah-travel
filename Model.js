@@ -382,9 +382,15 @@ function formatDateRange(startDate, endDate) {
 
 /** Prefer the server-provided trip.dateRange, else format the dates locally. */
 function tripDateRange(trip) {
-  if (!trip) return "";
-  if (trip.dateRange) return trip.dateRange;
-  return formatDateRange(trip.startDate, trip.endDate);
+  if (!trip) return ""
+  var dr = trip.dateRange
+  if (typeof dr === "string" && dr.length > 0) return dr
+  if (dr && typeof dr === "object") {
+    var start = dr.start || trip.startDate
+    var end = dr.end || trip.endDate
+    if (start || end) return formatDateRange(start, end)
+  }
+  return formatDateRange(trip.startDate, trip.endDate)
 }
 
 /** Small Nerd Font weather map (nf-weather-* range). */
@@ -396,4 +402,179 @@ function weatherGlyph(condition) {
   if (c.indexOf("cloud") >= 0 || c.indexOf("overcast") >= 0 || c.indexOf("fog") >= 0 || c.indexOf("mist") >= 0) return "\ue33d";
   if (c.indexOf("clear") >= 0 || c.indexOf("sun") >= 0) return "\ue30d";
   return "\ue302";
+}
+
+
+// ---------------------------------------------------------------------------
+// Local-input bounds: the snapshot written by bin/nowah-sync, search queries,
+// and persisted recents are all re-validated here before they reach any
+// model, Repeater, URL, or settings write. Same-UID neighbours (other
+// plugins) are inside the threat model, so nothing local is trusted either.
+// ---------------------------------------------------------------------------
+
+var MAX_QUERY_CHARS = 200
+var MAX_RECENTS = 4
+var SNAPSHOT_MAX_TRIPS = 25
+var SNAPSHOT_MAX_FLIGHTS = 12
+var VERIFY_URL_RE = /^https:\/\/app\.nowah\.xyz\/device\?code=[A-Z0-9]{4}-[A-Z0-9]{4}$/
+var USER_CODE_RE = /^[A-Z0-9]{4}-[A-Z0-9]{4}$/
+var IDENT_RE = /^[A-Za-z0-9_-]{1,64}$/
+// Markup delimiters, C0/C1 controls, soft hyphen, zero-width/bidi/format chars.
+var STRIP_RE = /[<>\u0000-\u001f\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufff9-\ufffb]/g
+
+// A slice at a UTF-16 boundary can split a surrogate pair; a lone surrogate
+// makes encodeURIComponent throw and renders as U+FFFD, so drop it.
+var LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/g
+
+function stripLoneSurrogates(value) {
+  return value.replace(LONE_SURROGATE_RE, "$1")
+}
+
+function boundedString(value, max) {
+  if (typeof value !== "string") return null
+  var cleaned = value.replace(STRIP_RE, "")
+  if (cleaned.length > max) cleaned = cleaned.slice(0, max)
+  return stripLoneSurrogates(cleaned)
+}
+
+function finiteNumber(value) {
+  if (typeof value !== "number" || !isFinite(value)) return null
+  if (value > 1e9 || value < -1e9) return null
+  return value
+}
+
+function boundedDate(value) {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}/.test(value)) return null
+  return value.slice(0, 32)
+}
+
+function sanitizeQuery(value) {
+  if (typeof value !== "string") return ""
+  var q = value.replace(STRIP_RE, "").replace(/\s+/g, " ").trim()
+  if (q.length > MAX_QUERY_CHARS) q = q.slice(0, MAX_QUERY_CHARS)
+  return stripLoneSurrogates(q).trim()
+}
+
+// Scan bound: a hostile list is never walked past a fixed number of entries.
+var MAX_RECENTS_SCAN = 32
+
+function sanitizeRecents(list) {
+  if (!Array.isArray(list)) return []
+  var out = []
+  for (var i = 0; i < list.length && i < MAX_RECENTS_SCAN && out.length < MAX_RECENTS; i++) {
+    var q = sanitizeQuery(list[i])
+    if (q !== "" && out.indexOf(q) === -1) out.push(q)
+  }
+  return out
+}
+
+function sanitizeFlight(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null
+  return {
+    flightNumber: boundedString(raw.flightNumber, 12),
+    depCode: boundedString(raw.depCode, 4),
+    arrCode: boundedString(raw.arrCode, 4),
+    depAt: boundedDate(raw.depAt),
+    arrAt: boundedDate(raw.arrAt)
+  }
+}
+
+function sanitizeTrip(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null
+  var id = typeof raw.id === "string" && IDENT_RE.test(raw.id) ? raw.id : null
+  if (!id) return null
+  var flights = []
+  if (Array.isArray(raw.flights)) {
+    for (var i = 0; i < raw.flights.length && flights.length < SNAPSHOT_MAX_FLIGHTS; i++) {
+      var f = sanitizeFlight(raw.flights[i])
+      if (f) flights.push(f)
+    }
+  }
+  var weather = null
+  if (raw.weather && typeof raw.weather === "object" && !Array.isArray(raw.weather)) {
+    weather = { temp: finiteNumber(raw.weather.temp), condition: boundedString(raw.weather.condition, 40) }
+  }
+  var dateRange = null
+  if (raw.dateRange && typeof raw.dateRange === "object" && !Array.isArray(raw.dateRange)) {
+    dateRange = { start: boundedDate(raw.dateRange.start), end: boundedDate(raw.dateRange.end) }
+  }
+  return {
+    id: id,
+    name: boundedString(raw.name, 80),
+    status: boundedString(raw.status, 32),
+    tripStatus: boundedString(raw.tripStatus, 32),
+    startDate: boundedDate(raw.startDate),
+    endDate: boundedDate(raw.endDate),
+    dateRange: dateRange,
+    destination: boundedString(raw.destination, 80),
+    destinationCity: boundedString(raw.destinationCity, 60),
+    destinationCountry: boundedString(raw.destinationCountry, 60),
+    weather: weather,
+    flights: flights
+  }
+}
+
+function sanitizePairing(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null
+  var userCode = typeof raw.userCode === "string" && USER_CODE_RE.test(raw.userCode) ? raw.userCode : null
+  if (!userCode) return null
+  var url = typeof raw.verificationUrl === "string" && VERIFY_URL_RE.test(raw.verificationUrl) ? raw.verificationUrl : null
+  var interval = finiteNumber(raw.interval)
+  return {
+    userCode: userCode,
+    verificationUrl: url,
+    expiresAt: boundedDate(raw.expiresAt),
+    interval: interval === null ? 5 : Math.min(60, Math.max(1, Math.round(interval)))
+  }
+}
+
+/** Re-validate a parsed status.json before it becomes model state; null = reject. */
+function sanitizeSnapshot(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null
+  var auth = raw.auth && typeof raw.auth === "object" && !Array.isArray(raw.auth) ? raw.auth : {}
+  var state = auth.state === "signed_in" || auth.state === "pairing" ? auth.state : "signed_out"
+  var trips = []
+  if (Array.isArray(raw.trips)) {
+    for (var i = 0; i < raw.trips.length && trips.length < SNAPSHOT_MAX_TRIPS; i++) {
+      var t = sanitizeTrip(raw.trips[i])
+      if (t) trips.push(t)
+    }
+  }
+  var unread = finiteNumber(raw.unreadCount)
+  unread = unread === null ? 0 : Math.min(9999, Math.max(0, Math.floor(unread)))
+  var flightStatus = null
+  var fs = raw.flightStatus
+  if (fs && typeof fs === "object" && !Array.isArray(fs)) {
+    var d = fs.data && typeof fs.data === "object" && !Array.isArray(fs.data) ? fs.data : {}
+    flightStatus = {
+      flightNumber: boundedString(fs.flightNumber, 12),
+      fetchedAt: boundedDate(fs.fetchedAt),
+      data: {
+        status: boundedString(d.status, 24),
+        delayMinutes: finiteNumber(d.delayMinutes),
+        progressPercent: finiteNumber(d.progressPercent),
+        gate: boundedString(d.gate, 8),
+        terminal: boundedString(d.terminal, 8)
+      }
+    }
+  }
+  var last = raw.lastSync && typeof raw.lastSync === "object" && !Array.isArray(raw.lastSync) ? raw.lastSync : {}
+  return {
+    version: 1,
+    generatedAt: boundedDate(raw.generatedAt),
+    auth: {
+      state: state,
+      error: boundedString(auth.error, 120),
+      pairing: state === "pairing" ? sanitizePairing(auth.pairing) : null,
+      profile: null
+    },
+    trips: trips,
+    unreadCount: unread,
+    flightStatus: flightStatus,
+    lastSync: {
+      ok: last.ok === true,
+      at: boundedDate(last.at),
+      error: boundedString(last.error, 120)
+    }
+  }
 }

@@ -16,10 +16,15 @@
 #   * Every response is size-capped on the wire and again on disk, kept in a
 #     private file (never a shell variable), and reduced through a strict
 #     whitelist/truncate/strip jq schema before anything reaches status.json.
-#   * State lives in a 0700 directory we own; every leaf is checked for
-#     type/owner/no-symlink before use and published via O_EXCL temp + rename.
-#     Runs are serialised with flock. (Check-then-use in bash is inherently
-#     racy, but only a same-UID actor can race inside a 0700 dir we own.)
+#   * State I/O is descriptor-bound: the state directory is opened once,
+#     verified, locked (flock on the directory itself — there is no lock
+#     file), and every leaf is then addressed relative to that descriptor.
+#     Reads open the leaf and verify the OPENED object (regular, ours, one
+#     link, bounded, same inode the name points at) before reading through
+#     that same descriptor; writes go to an O_EXCL temp opened append-only
+#     (never truncating anything swapped in), verified the same way, then
+#     renamed into place — rename replaces a symlink, it never follows one.
+#     Other same-UID plugins are inside the threat model.
 #   * One absolute deadline bounds the whole run; each curl gets the
 #     remaining budget; the helper stops if its supervising parent is gone.
 #
@@ -67,11 +72,19 @@ if [[ -z "$STATE_BASE" || "$STATE_BASE" != /* ]]; then
   [[ -n "${HOME:-}" && "$HOME" == /* ]] || { echo "nowah-sync: HOME must be an absolute path" >&2; exit 2; }
   STATE_BASE="$HOME/.local/state"
 fi
+# A relocated (symlinked) state base is fine as long as it resolves to a
+# directory we own; the resolved path is what gets bound and verified below.
+if [[ -L "$STATE_BASE" ]]; then
+  resolved_base="$(realpath -e "$STATE_BASE" 2>/dev/null || true)"
+  [[ -n "$resolved_base" && -d "$resolved_base" && "$(stat -c %u "$resolved_base")" == "$(id -u)" ]] \
+    || { echo "nowah-sync: state base symlink does not resolve to a directory we own" >&2; exit 2; }
+  STATE_BASE="$resolved_base"
+fi
 STATE_DIR="$STATE_BASE/$STATE_LEAF"
-TOKEN_FILE="$STATE_DIR/token"
-DEVICE_FILE="$STATE_DIR/device.json"
-STATUS_FILE="$STATE_DIR/status.json"
-LOCK_FILE="$STATE_DIR/.lock"
+# Leaf names under the bound state directory (fd 9).
+TOKEN_LEAF="token"
+DEVICE_LEAF="device.json"
+STATUS_LEAF="status.json"
 
 # ---------------------------------------------------------------------------
 # bounds
@@ -98,83 +111,116 @@ remaining() {
 # via timeout) is gone: reparented to init means we were orphaned.
 parent_alive() {
   local ppid
-  ppid="$(cut -d' ' -f4 "/proc/$$/stat" 2>/dev/null || echo "$PARENT_PID")"
+  ppid="$(sed 's/.*) //' "/proc/$$/stat" 2>/dev/null | awk '{print $2}' || true)"
+  [[ -n "$ppid" ]] || ppid="$PARENT_PID"
   [[ "$ppid" == "$PARENT_PID" ]]
 }
 
 # ---------------------------------------------------------------------------
-# private state I/O
+# private state I/O — descriptor-bound (fd 9 = state dir, fd 8 = scratch,
+# fd 7 = current HTTP body)
 # ---------------------------------------------------------------------------
 
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 die() { echo "nowah-sync: $*" >&2; exit 1; }
 
-# The 0700 directory we own is the security boundary; these checks make sure
-# it really is that, and refuse to operate on anything else.
-ensure_state_dir() {
+# fd paths use /proc/self, not /proc/$$: every external command (stat, jq,
+# curl, mktemp, mv) inherits our descriptors, and inside a pipeline subshell
+# $$ would name the parent shell's table rather than the one holding the fd.
+D=""   # "/proc/self/fd/9" once the state directory is bound
+
+# Bind the state directory once. Every later operation goes through $D, so
+# what was verified here is what gets used, regardless of what happens to the
+# pathname afterwards.
+open_state_dir() {
   [[ -d "$STATE_BASE" ]] || mkdir -p "$STATE_BASE"
   [[ ! -L "$STATE_BASE" ]] || die "state base is a symlink: $STATE_BASE"
   [[ "$(stat -c %u "$STATE_BASE")" == "$(id -u)" ]] || die "state base not owned by us"
-  if [[ -L "$STATE_DIR" ]]; then die "state dir is a symlink: $STATE_DIR"; fi
-  if [[ ! -e "$STATE_DIR" ]]; then mkdir "$STATE_DIR"; fi
-  [[ -d "$STATE_DIR" ]] || die "state dir is not a directory: $STATE_DIR"
-  [[ "$(stat -c %u "$STATE_DIR")" == "$(id -u)" ]] || die "state dir not owned by us"
-  chmod 700 "$STATE_DIR"
+  local canonical
+  canonical="$(realpath -e "$STATE_BASE")/$STATE_LEAF"
+  [[ ! -L "$STATE_DIR" ]] || die "state dir is a symlink: $STATE_DIR"
+  [[ -e "$STATE_DIR" ]] || mkdir "$STATE_DIR" 2>/dev/null || true
+  # -d by name before opening: a planted FIFO would otherwise block the open.
+  [[ -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] || die "state dir is not a directory: $STATE_DIR"
+  { exec 9<"$STATE_DIR"; } 2>/dev/null || die "cannot open state dir"
+  D="/proc/self/fd/9"
+  [[ "$(readlink "/proc/self/fd/9")" == "$canonical" ]] || die "state dir resolved elsewhere"
+  [[ "$(stat -L -c %F "$D")" == "directory" ]] || die "state dir is not a directory"
+  [[ "$(stat -L -c %u "$D")" == "$(id -u)" ]] || die "state dir not owned by us"
+  chmod 700 "$D"
   # Sweep temp leaves from runs that died long ago (never a live sibling's).
-  find "$STATE_DIR" -maxdepth 1 -name '.tmp.*' -type f -user "$(id -un)" -mmin +10 -delete 2>/dev/null || true
+  find "$D/" -maxdepth 1 -name '.tmp.*' -type f -mmin +10 -delete 2>/dev/null || true
 }
 
-# acquire_lock — serialise helper runs. Returns 1 if the lock is busy past
-# the remaining budget (callers decide whether that is retryable).
-acquire_lock() {
-  leaf_ok "$LOCK_FILE" || die "refusing non-regular lock leaf"
-  exec 9>"$LOCK_FILE"
-  chmod 600 "$LOCK_FILE"
-  flock -w "$(remaining)" 9
-}
+# Serialise helper runs on the directory descriptor itself: no lock file, so
+# nothing to swap for a symlink and truncate.
+acquire_lock() { flock -w "$(remaining)" 9; }
 
-# leaf_ok PATH — true when PATH is absent or a regular, non-symlink file we own.
-leaf_ok() {
-  local p="$1"
-  [[ -e "$p" || -L "$p" ]] || return 0
-  [[ ! -L "$p" ]] || return 1
-  [[ -f "$p" ]] || return 1
-  [[ "$(stat -c %u "$p")" == "$(id -u)" ]] || return 1
+# verify_fd FD MAXSIZE NAMEPATH — the object behind FD must be a regular file
+# we own with exactly one link, within MAXSIZE, and the same inode NAMEPATH
+# currently points at (so a symlink or swapped leaf is caught after open).
+VERIFIED_ID=""   # "dev:ino" of the object verify_fd last accepted
+
+verify_fd() {
+  local fd="$1" max="$2" namepath="$3"
+  local ftype uid nlink size id_open id_name
+  IFS='|' read -r ftype uid nlink size id_open < <(stat -L -c '%F|%u|%h|%s|%d:%i' "/proc/self/fd/$fd" 2>/dev/null || echo '||||')
+  id_name="$(stat -c '%d:%i' "$namepath" 2>/dev/null || echo -1)"
+  VERIFIED_ID=""
+  [[ "$ftype" == "regular file" || "$ftype" == "regular empty file" ]] || return 1
+  [[ "$uid" == "$(id -u)" ]] || return 1
+  [[ "$nlink" == "1" ]] || return 1
+  [[ "$size" =~ ^[0-9]+$ ]] && (( size <= max )) || return 1
+  [[ "$id_open" == "$id_name" ]] || return 1
+  VERIFIED_ID="$id_open"
   return 0
 }
 
-# leaf_present PATH — true when PATH exists AND passes leaf_ok.
-leaf_present() {
-  local p="$1"
-  [[ -e "$p" ]] || return 1
-  leaf_ok "$p"
+leaf_present() { local p="$D/$1"; [[ -f "$p" && ! -L "$p" ]]; }
+
+# read_leaf NAME MAXBYTES — open, verify the opened object, read through the
+# same descriptor. Fails (prints nothing) when the leaf is unusable.
+read_leaf() {
+  local name="$1" max="$2" p="$D/$1"
+  # -f by name first: a planted FIFO would otherwise block the open forever.
+  [[ -f "$p" && ! -L "$p" ]] || return 1
+  { exec 8<"$p"; } 2>/dev/null || return 1
+  if ! verify_fd 8 "$max" "$p"; then
+    exec 8<&-
+    # Whatever was planted under our name is not ours to keep; unlink never
+    # follows a link, so this only ever removes the planted entry itself.
+    rm -f "$p"
+    return 1
+  fi
+  head -c "$max" <&8
+  exec 8<&-
 }
 
-# safe_read PATH MAXBYTES — prints file content, bounded; fails when unusable.
-safe_read() {
-  local p="$1" max="$2"
-  leaf_present "$p" || return 1
-  local size
-  size="$(stat -c %s "$p")"
-  (( size <= max )) || return 1
-  head -c "$max" "$p"
-}
-
-# publish PATH — atomically replace PATH with stdin (O_EXCL temp + rename).
+# publish NAME — stdin → fresh O_EXCL 0600 temp (opened append-only, so a
+# swapped-in target could never be truncated), verified, then renamed over
+# NAME. rename(2) replaces a symlink at NAME; it never follows it.
 publish() {
-  local target="$1" tmp
-  leaf_ok "$target" || die "refusing to replace non-regular leaf: $target"
-  tmp="$(mktemp "$STATE_DIR/.tmp.XXXXXXXX")"
-  cat > "$tmp"
-  chmod 600 "$tmp"
-  mv -T -f "$tmp" "$target"
+  local name="$1" tmp
+  [[ ! -d "$D/$name" || -L "$D/$name" ]] || die "refusing to replace a directory: $name"
+  tmp="$(mktemp "$D/.tmp.XXXXXXXX")"
+  [[ -f "$tmp" && ! -L "$tmp" ]] || { rm -f "$tmp"; die "temp leaf changed underfoot"; }
+  { exec 8>>"$tmp"; } 2>/dev/null || { rm -f "$tmp"; die "cannot open temp leaf"; }
+  if ! verify_fd 8 0 "$tmp"; then exec 8>&-; rm -f "$tmp"; die "temp leaf changed underfoot"; fi
+  local expected="$VERIFIED_ID"
+  cat >&8
+  exec 8>&-
+  # The rename itself is by name; narrow the window by confirming the name
+  # still refers to the object we filled.
+  [[ "$(stat -c '%d:%i' "$tmp" 2>/dev/null)" == "$expected" ]] || { rm -f "$tmp"; die "temp leaf swapped before publish"; }
+  mv -T -f "$tmp" "$D/$name"
 }
 
-# remove_leaf PATH — delete a state leaf (never follow links).
+# remove_leaf NAME — unlink never follows a symlink; directories are refused.
 remove_leaf() {
-  local p="$1"
+  local p="$D/$1"
   [[ -e "$p" || -L "$p" ]] || return 0
-  if [[ -L "$p" ]] || [[ -f "$p" ]]; then rm -f "$p"; fi
+  [[ ! -d "$p" || -L "$p" ]] || die "refusing to remove a directory: $1"
+  rm -f "$p"
 }
 
 # ---------------------------------------------------------------------------
@@ -249,14 +295,31 @@ FLIGHT_CARRY_SCHEMA="$JQ_PRELUDE"'
 '
 
 # Read a jq expression out of the existing status file (fallback when absent).
+# prev EXPR FALLBACK — read the previous snapshot; it must be exactly one JSON
+# document (slurp + length check) or the fallback is used. Every carried value
+# is then passed through its own schema by the prev_* helpers below.
 prev() {
-  local expr="$1" fallback="${2:-null}"
-  if leaf_present "$STATUS_FILE" && (( $(stat -c %s "$STATUS_FILE") <= MAX_STATUS_BYTES )); then
-    jq -c "$expr // $fallback" "$STATUS_FILE" 2>/dev/null || printf '%s' "$fallback"
-  else
-    printf '%s' "$fallback"
-  fi
+  local expr="$1" fallback="${2:-null}" out=""
+  out="$(read_leaf "$STATUS_LEAF" "$MAX_STATUS_BYTES" \
+    | jq -cs "if length == 1 then ((.[0] | $expr) // $fallback) else $fallback end" 2>/dev/null)" || out=""
+  [[ -n "$out" ]] || out="$fallback"
+  printf '%s' "$out"
 }
+
+PAIRING_CARRY_SCHEMA="$JQ_PRELUDE"'
+  if type != "object" then null else
+    (.userCode | if type == "string" and test("^[A-Z0-9]{4}-[A-Z0-9]{4}$") then . else null end) as $code
+    | if $code == null then null else
+      { userCode: $code,
+        verificationUrl: (if .verificationUrl == ($app + "/device?code=" + $code) then .verificationUrl else null end),
+        expiresAt: (.expiresAt | dt),
+        interval: ((.interval | num) | if . == null then 5 else ([1, ([60, .] | min)] | max | floor) end) }
+      end
+  end
+'
+
+prev_pairing() { prev '.auth.pairing' | jq -c --arg app "$APP_ORIGIN" "$PAIRING_CARRY_SCHEMA" 2>/dev/null || printf 'null'; }
+prev_error() { prev '.auth.error' | jq -r "$JQ_PRELUDE"' (s(120)) // ""' 2>/dev/null || true; }
 
 prev_trips() { prev '.trips' '[]' | jq -c "$TRIP_LIST_SCHEMA" 2>/dev/null || printf '[]'; }
 prev_unread() { prev '.unreadCount' '0' | jq -c 'if type == "number" and . >= 0 and . <= 9999 then floor else 0 end' 2>/dev/null || printf '0'; }
@@ -301,14 +364,14 @@ write_status() {
       flightStatus: $flight,
       lastSync: { ok: $ok, at: $at, error: (if $syncerr == "" then null else $syncerr[0:120] end) }
     }')"
-  if (( ${#doc} > MAX_STATUS_BYTES )); then
+  if (( ${#doc} + 1 > MAX_STATUS_BYTES )); then
     # Fail closed: never publish an oversized snapshot.
     doc="$(jq -cn --arg at "$(now_iso)" --arg state "$1" \
       '{version:1, generatedAt:$at, auth:{state:$state,error:null,pairing:null,profile:null},
         trips:[], unreadCount:0, flightStatus:null,
         lastSync:{ok:false, at:$at, error:"snapshot exceeded size limit"}}')"
   fi
-  printf '%s\n' "$doc" | publish "$STATUS_FILE"
+  printf '%s\n' "$doc" | publish "$STATUS_LEAF"
 }
 
 preflight() {
@@ -317,11 +380,10 @@ preflight() {
   command -v jq >/dev/null 2>&1 || missing="${missing:+$missing }jq"
   command -v flock >/dev/null 2>&1 || missing="${missing:+$missing }flock"
   if [[ -n "$missing" ]]; then
-    ensure_state_dir
     local at
     at="$(now_iso)"
     printf '{"version":1,"generatedAt":"%s","auth":{"state":"signed_out","error":"missing dependency: %s","pairing":null,"profile":null},"trips":[],"unreadCount":0,"flightStatus":null,"lastSync":{"ok":false,"at":"%s","error":"missing dependency: %s"}}\n' \
-      "$at" "$missing" "$at" "$missing" | publish "$STATUS_FILE"
+      "$at" "$missing" "$at" "$missing" | publish "$STATUS_LEAF"
     die "missing dependency: $missing"
   fi
 }
@@ -331,9 +393,14 @@ preflight() {
 # ---------------------------------------------------------------------------
 
 HTTP_CODE=""
-HTTP_BODY_FILE=""
+HTTP_BODY_FILE=""   # "/proc/self/fd/7" while a body is held — all reads go via the descriptor
+HTTP_BODY_PATH=""   # the temp leaf's name, used only to unlink it
 
-cleanup_body() { [[ -n "$HTTP_BODY_FILE" ]] && rm -f "$HTTP_BODY_FILE"; HTTP_BODY_FILE=""; }
+cleanup_body() {
+  { exec 7>&-; } 2>/dev/null || true
+  [[ -n "$HTTP_BODY_PATH" ]] && rm -f "$HTTP_BODY_PATH"
+  HTTP_BODY_PATH=""; HTTP_BODY_FILE=""
+}
 trap cleanup_body EXIT
 
 # request URL MAXBYTES [BEARER] [JSON_BODY]
@@ -349,7 +416,12 @@ request() {
   local budget
   budget="$(remaining)"
   (( budget > 0 )) || return 1
-  HTTP_BODY_FILE="$(mktemp "$STATE_DIR/.tmp.XXXXXXXX")"
+  # Body leaf: O_EXCL temp, opened append-only and verified, then handed to
+  # curl and jq ONLY as the descriptor's magic link — never re-resolved by name.
+  HTTP_BODY_PATH="$(mktemp "$D/.tmp.XXXXXXXX")"
+  { exec 7>>"$HTTP_BODY_PATH"; } 2>/dev/null || { rm -f "$HTTP_BODY_PATH"; HTTP_BODY_PATH=""; return 1; }
+  if ! verify_fd 7 0 "$HTTP_BODY_PATH"; then cleanup_body; return 1; fi
+  HTTP_BODY_FILE="/proc/self/fd/7"
 
   # -q FIRST: never read ~/.curlrc, which could alter TLS/proxy/redirect posture.
   local -a args=(-q --silent
@@ -376,7 +448,7 @@ request() {
   # Any curl-level failure (incl. --max-filesize overrun, rc 63) is a transport
   # failure regardless of the HTTP status that came with it.
   [[ "$rc" == "0" ]] || code="000"
-  if [[ -f "$HTTP_BODY_FILE" ]] && (( $(stat -c %s "$HTTP_BODY_FILE") > max )); then
+  if (( $(stat -L -c %s "$HTTP_BODY_FILE" 2>/dev/null || echo 0) > max )); then
     : > "$HTTP_BODY_FILE"
     code="000"
   fi
@@ -387,7 +459,7 @@ request() {
 # body_get EXPR FALLBACK — jq over the body file, tolerating non-JSON.
 body_get() {
   local expr="$1" fallback="${2:-null}"
-  [[ -n "$HTTP_BODY_FILE" && -s "$HTTP_BODY_FILE" ]] || { printf '%s' "$fallback"; return; }
+  [[ -n "$HTTP_BODY_FILE" ]] && (( $(stat -L -c %s "$HTTP_BODY_FILE" 2>/dev/null || echo 0) > 0 )) || { printf '%s' "$fallback"; return; }
   jq -c "$expr // $fallback" "$HTTP_BODY_FILE" 2>/dev/null || printf '%s' "$fallback"
 }
 
@@ -405,10 +477,10 @@ TOKEN_RE='^nowah_dev_[A-Za-z0-9_-]{20,128}$'
 #   (production origin only); anything else that does not match is removed.
 load_token() {
   local raw origin token
-  raw="$(safe_read "$TOKEN_FILE" "$MAX_SECRET_FILE")" || return 1
+  raw="$(read_leaf "$TOKEN_LEAF" "$MAX_SECRET_FILE")" || return 1
   raw="${raw%$'\n'}"
   if [[ "$raw" =~ $TOKEN_RE ]]; then
-    [[ "$API_ORIGIN" == "$PROD_API_ORIGIN" ]] || { remove_leaf "$TOKEN_FILE"; return 1; }
+    [[ "$API_ORIGIN" == "$PROD_API_ORIGIN" ]] || { remove_leaf "$TOKEN_LEAF"; return 1; }
     store_token "$raw" || return 1
     printf '%s' "$raw"
     return 0
@@ -416,7 +488,7 @@ load_token() {
   origin="$(printf '%s' "$raw" | jq -r '.origin // empty' 2>/dev/null || true)"
   token="$(printf '%s' "$raw" | jq -r '.token // empty' 2>/dev/null || true)"
   if [[ "$origin" != "$API_ORIGIN" || ! "$token" =~ $TOKEN_RE ]]; then
-    remove_leaf "$TOKEN_FILE"
+    remove_leaf "$TOKEN_LEAF"
     return 1
   fi
   printf '%s' "$token"
@@ -425,7 +497,7 @@ load_token() {
 store_token() {
   local token="$1"
   [[ "$token" =~ $TOKEN_RE ]] || return 1
-  printf '%s' "$token" | jq -Rc --arg origin "$API_ORIGIN" '{origin: $origin, token: .}' | publish "$TOKEN_FILE"
+  printf '%s' "$token" | jq -Rc --arg origin "$API_ORIGIN" '{origin: $origin, token: .}' | publish "$TOKEN_LEAF"
 }
 
 # ---------------------------------------------------------------------------
@@ -444,11 +516,11 @@ cmd_refresh() {
     # Not signed in. Never clobber an in-flight pairing (or the auth error
     # explaining why we are signed out) — pair-start/pair-poll own those.
     local pairing autherr state exp
-    pairing="$(prev '.auth.pairing')"
-    autherr="$(prev '.auth.error' 'null' | jq -r 'if . == null then "" else . end')"
+    pairing="$(prev_pairing)"
+    autherr="$(prev_error)"
     state="signed_out"
     if [[ "$pairing" != "null" ]]; then
-      exp="$(printf '%s' "$pairing" | jq -r '.expiresAt // empty')"
+      exp="$(printf '%s' "$pairing" | jq -r 'if type == "object" then (.expiresAt // empty) else empty end' 2>/dev/null || true)"
       if [[ "$exp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$ ]] \
          && [[ "$(date -u -d "$exp" +%s 2>/dev/null || echo 0)" -gt "$(date -u +%s)" ]]; then
         state="pairing"
@@ -472,7 +544,7 @@ cmd_refresh() {
   fi
   case "$HTTP_CODE" in
     401|403)
-      remove_leaf "$TOKEN_FILE"
+      remove_leaf "$TOKEN_LEAF"
       write_status "signed_out" "revoked" null '[]' 0 null true ""
       return 0
       ;;
@@ -514,7 +586,7 @@ cmd_refresh() {
 
   # A disconnect cannot interleave (flock), but never publish signed_in
   # unless the credential is still on disk.
-  leaf_present "$TOKEN_FILE" || { write_status "signed_out" "" null '[]' 0 null true ""; return 0; }
+  leaf_present "$TOKEN_LEAF" || { write_status "signed_out" "" null '[]' 0 null true ""; return 0; }
   write_status "signed_in" "" null "$trips" "$unread" "$flight_status" true ""
 }
 
@@ -548,7 +620,7 @@ cmd_pair_start() {
   local device_ok
   device_ok="$(jq -r '.data.deviceCode | if type == "string" and test("^[a-f0-9]{64}$") then "ok" else "bad" end' "$HTTP_BODY_FILE" 2>/dev/null || echo bad)"
   [[ "$device_ok" == "ok" ]] || die "malformed device code from server"
-  jq -c --arg expiresAt "$expires_at" '{deviceCode: .data.deviceCode, expiresAt: $expiresAt}' "$HTTP_BODY_FILE" | publish "$DEVICE_FILE"
+  jq -c --arg expiresAt "$expires_at" '{deviceCode: .data.deviceCode, expiresAt: $expiresAt}' "$HTTP_BODY_FILE" | publish "$DEVICE_LEAF"
 
   # The verification URL is built locally from the validated code and the
   # pinned app origin — a server-supplied URL is never launched.
@@ -566,10 +638,10 @@ cmd_pair_start() {
 
 cmd_pair_poll() {
   local device_ok
-  device_ok="$(safe_read "$DEVICE_FILE" "$MAX_SECRET_FILE" \
+  device_ok="$(read_leaf "$DEVICE_LEAF" "$MAX_SECRET_FILE" \
     | jq -r '.deviceCode | if type == "string" and test("^[a-f0-9]{64}$") then "ok" else "bad" end' 2>/dev/null || echo bad)"
   if [[ "$device_ok" != "ok" ]]; then
-    remove_leaf "$DEVICE_FILE"
+    remove_leaf "$DEVICE_LEAF"
     write_status "signed_out" "" null '[]' 0 null true ""
     return 1
   fi
@@ -577,7 +649,7 @@ cmd_pair_poll() {
   # Request body built from the device file on stdin — the code never enters
   # a shell variable or any argv.
   local req
-  req="$(safe_read "$DEVICE_FILE" "$MAX_SECRET_FILE" | jq -c '{deviceCode: .deviceCode}')"
+  req="$(read_leaf "$DEVICE_LEAF" "$MAX_SECRET_FILE" | jq -c '{deviceCode: .deviceCode}')"
   if ! request "$API_ORIGIN/device-auth/token" "$MAX_BODY_SMALL" "" "$req"; then
     return 10 # transient network problem — keep polling
   fi
@@ -588,11 +660,11 @@ cmd_pair_poll() {
     if ! store_token "$token"; then
       # The grant was consumed server-side but the token is unusable: fail
       # closed rather than poll a redeemed code forever.
-      remove_leaf "$DEVICE_FILE"
+      remove_leaf "$DEVICE_LEAF"
       write_status "signed_out" "pairing failed" null '[]' 0 null true ""
       return 0
     fi
-    remove_leaf "$DEVICE_FILE"
+    remove_leaf "$DEVICE_LEAF"
     cmd_refresh
     return 0
   fi
@@ -600,11 +672,11 @@ cmd_pair_poll() {
   case "$(body_str '.error.code')" in
     authorization_pending|slow_down) return 10 ;;
     expired_token)
-      remove_leaf "$DEVICE_FILE"
+      remove_leaf "$DEVICE_LEAF"
       write_status "signed_out" "expired" null '[]' 0 null true ""
       return 0 ;;
     access_denied)
-      remove_leaf "$DEVICE_FILE"
+      remove_leaf "$DEVICE_LEAF"
       write_status "signed_out" "denied" null '[]' 0 null true ""
       return 0 ;;
     *) return 10 ;;
@@ -616,16 +688,16 @@ cmd_pair_poll() {
 # ---------------------------------------------------------------------------
 
 cmd_disconnect() {
-  remove_leaf "$TOKEN_FILE"
-  remove_leaf "$DEVICE_FILE"
+  remove_leaf "$TOKEN_LEAF"
+  remove_leaf "$DEVICE_LEAF"
   write_status "signed_out" "" null '[]' 0 null true ""
 }
 
 # ---------------------------------------------------------------------------
 
 main() {
+  open_state_dir
   preflight
-  ensure_state_dir
   local cmd="${1:-refresh}"
   case "$cmd" in
     refresh|pair-start|pair-poll|disconnect) ;;
@@ -633,8 +705,9 @@ main() {
       echo "usage: nowah-sync {refresh | pair-start | pair-poll | disconnect}" >&2
       return 2 ;;
   esac
-  if ! acquire_lock; then
-    # Another helper run owns the state right now.
+  if ! acquire_lock || (( $(remaining) < 5 )); then
+    # Another helper run owns (or just finished owning) the state; a fresh
+    # snapshot is already on disk, so publishing a "network error" would lie.
     [[ "$cmd" == "pair-poll" ]] && return 10
     return 0
   fi

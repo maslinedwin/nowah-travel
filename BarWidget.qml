@@ -22,10 +22,28 @@ BarWidget {
 
   // Applied locally first so the panel updates on the action itself; the
   // shell.json write comes back through the bar as the same value.
+  // Only known settings keys are carried into the shell.json entry, and the
+  // recents list is re-bounded (count, length, charset) before persisting —
+  // an aggregate cap on what this plugin can ever write there.
+  // Values are coerced to their declared types (never copied raw), so a
+  // poisoned entry can never be re-persisted by this plugin.
+  function boundedSettings() {
+    var s = root.settings || {}
+    var out = {}
+    if (s.showRecent !== undefined) out.showRecent = s.showRecent === true
+    if (s.rotateExamples !== undefined) out.rotateExamples = s.rotateExamples === true
+    if (s.showNotifications !== undefined) out.showNotifications = s.showNotifications === true
+    if (s.countdownDays !== undefined) {
+      var days = Number(s.countdownDays)
+      out.countdownDays = isNaN(days) ? 14 : Math.max(1, Math.min(60, Math.round(days)))
+    }
+    return out
+  }
+
   function saveRecents(list) {
-    var entry = { id: root.moduleName }
-    for (var key in root.settings) if (key !== "id") entry[key] = root.settings[key]
-    entry.recentSearches = list
+    var entry = root.boundedSettings()
+    entry.id = root.moduleName
+    entry.recentSearches = Model.sanitizeRecents(list)
     root.settings = entry
     if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
       root.bar.shell.updateEntryInline(root.moduleName, entry)
@@ -69,6 +87,9 @@ BarWidget {
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
     function search(query: string): void {
+      // IPC is an untrusted producer: reject anything that is not a
+      // reasonably sized string before it reaches the panel.
+      if (typeof query !== "string" || query.length === 0 || query.length > 2000) return
       if (panelLoader.item && panelLoader.item.searchFor) panelLoader.item.searchFor(query)
     }
     function refresh(): void { NowahService.refreshNow() }

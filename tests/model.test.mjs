@@ -31,7 +31,7 @@ const trip = (over = {}) => ({
   tripStatus: 'upcoming',
   startDate: '2026-03-12',
   endDate: '2026-03-24',
-  dateRange: 'Mar 12 – 24',
+  dateRange: { start: '2026-03-12', end: '2026-03-24' },
   destination: 'Tokyo, Japan',
   destinationCity: 'Tokyo',
   destinationCountry: 'Japan',
@@ -262,4 +262,90 @@ test('upcomingTrips filters ended trips and sorts by start', () => {
   // join() instead of deepEqual: arrays from the vm realm have a foreign
   // Array.prototype, which strict deep equality rejects.
   assert.equal(up.map(t => t.id).join(','), 't-tokyo,t-later');
+});
+
+
+// ---------------------------------------------------------------------------
+// Local-input bounds (snapshot re-validation, query and recents caps).
+// ---------------------------------------------------------------------------
+
+test('sanitizeQuery bounds length, strips control/markup, collapses whitespace', () => {
+  const long = 'x'.repeat(500);
+  assert.equal(M.sanitizeQuery(long).length, M.MAX_QUERY_CHARS);
+  assert.equal(M.sanitizeQuery('  flights to  <b>Tokyo</b>\u200b '), 'flights to bTokyo/b');
+  assert.equal(M.sanitizeQuery(42), '');
+  assert.equal(M.sanitizeQuery(null), '');
+});
+
+test('sanitizeRecents caps count, dedupes, drops junk entries', () => {
+  // Arrays cross the vm realm boundary, so compare by value, not prototype.
+  const out = M.sanitizeRecents(['a', 'b', 'a', 7, '', 'c', 'd', 'e', 'f']);
+  assert.equal(JSON.stringify(out), JSON.stringify(['a', 'b', 'c', 'd']));
+  assert.equal(JSON.stringify(M.sanitizeRecents('not an array')), '[]');
+  assert.equal(JSON.stringify(M.sanitizeRecents([{ x: 1 }])), '[]');
+});
+
+test('sanitizeSnapshot rejects non-objects and normalises a hostile snapshot', () => {
+  assert.equal(M.sanitizeSnapshot(null), null);
+  assert.equal(M.sanitizeSnapshot([1, 2]), null);
+  assert.equal(M.sanitizeSnapshot('str'), null);
+
+  const trips = [];
+  for (let i = 0; i < 60; i++) trips.push(trip({ id: 't' + i, name: '<img src=x>' + 'n'.repeat(300) }));
+  trips.push(trip({ id: '../evil?x' }));
+  const snap = M.sanitizeSnapshot({
+    auth: { state: 'pairing', error: 'e'.repeat(500),
+            pairing: { userCode: 'ABCD-EFGH', verificationUrl: 'https://evil.example/device?code=ABCD-EFGH', interval: 999, expiresAt: '2099-01-01T00:00:00Z' } },
+    trips,
+    unreadCount: 50000,
+    flightStatus: { flightNumber: 'TK 12', data: { status: 'Delayed<script>', progressPercent: Infinity, delayMinutes: 25 } },
+    lastSync: { ok: 'yes', error: 12 },
+    extra: 'dropped',
+  });
+  assert.equal(snap.trips.length, M.SNAPSHOT_MAX_TRIPS);
+  assert.equal(snap.trips[0].name.length, 80);
+  assert.ok(!snap.trips[0].name.includes('<'));
+  assert.ok(!snap.trips.some((t) => t.id.includes('..')));
+  assert.equal(snap.auth.state, 'pairing');
+  assert.equal(snap.auth.error.length, 120);
+  assert.equal(snap.auth.pairing.userCode, 'ABCD-EFGH');
+  assert.equal(snap.auth.pairing.verificationUrl, null, 'off-origin verification URL must be dropped');
+  assert.equal(snap.auth.pairing.interval, 60);
+  assert.equal(snap.unreadCount, 9999, 'in-range values clamp to the display cap');
+  assert.equal(M.sanitizeSnapshot({ unreadCount: 1e12 }).unreadCount, 0, 'implausible magnitudes are dropped, not clamped');
+  assert.equal(M.sanitizeSnapshot({ unreadCount: -4 }).unreadCount, 0);
+  assert.equal(snap.flightStatus.data.status, 'Delayedscript');
+  assert.equal(snap.flightStatus.data.progressPercent, null);
+  assert.equal(snap.flightStatus.data.delayMinutes, 25);
+  assert.equal(snap.lastSync.ok, false);
+  assert.equal(snap.lastSync.error, null);
+  assert.equal(snap.extra, undefined);
+});
+
+test('sanitizeSnapshot caps flights per trip and keeps a valid pairing URL', () => {
+  const t = { id: 'ok', flights: new Array(40).fill({ flightNumber: 'TK 12', depCode: 'IST', arrCode: 'JFK', depAt: '2026-09-10T08:05:00', arrAt: '2026-09-10T12:30:00' }) };
+  const snap = M.sanitizeSnapshot({ auth: { state: 'pairing', pairing: { userCode: 'ABCD-EFGH', verificationUrl: 'https://app.nowah.xyz/device?code=ABCD-EFGH' } }, trips: [t] });
+  assert.equal(snap.trips[0].flights.length, M.SNAPSHOT_MAX_FLIGHTS);
+  assert.equal(snap.auth.pairing.verificationUrl, 'https://app.nowah.xyz/device?code=ABCD-EFGH');
+  assert.equal(snap.auth.pairing.interval, 5);
+  const bad = M.sanitizeSnapshot({ auth: { state: 'root', pairing: { userCode: 'ABCD-EFGH' } } });
+  assert.equal(bad.auth.state, 'signed_out');
+  assert.equal(bad.auth.pairing, null);
+});
+
+
+test('tripDateRange formats the sanitized {start,end} object and tolerates strings/nulls', () => {
+  const formatted = M.tripDateRange(trip());
+  assert.equal(typeof formatted, 'string');
+  assert.ok(!formatted.includes('[object'), formatted);
+  assert.equal(M.tripDateRange(trip({ dateRange: 'Mar 12 - 24' })), 'Mar 12 - 24');
+  assert.equal(typeof M.tripDateRange(trip({ dateRange: null })), 'string');
+  assert.equal(M.tripDateRange(null), '');
+});
+
+test('sanitizeQuery never leaves a lone surrogate at the cut (encodeURIComponent must not throw)', () => {
+  const q = M.sanitizeQuery('a'.repeat(199) + '\uD83D\uDE00' + 'tail');
+  assert.ok(q.length <= M.MAX_QUERY_CHARS);
+  assert.doesNotThrow(() => encodeURIComponent(q));
+  assert.equal(M.sanitizeQuery('x\uD83D\uDE00y'), 'x\uD83D\uDE00y', 'intact pairs survive');
 });

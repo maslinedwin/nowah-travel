@@ -73,28 +73,56 @@ Item {
     return !isNaN(exp) && root.now.getTime() < exp
   }
 
-  function reparseStatus() {
-    try {
-      var raw = statusFile.text()
-      if (!raw) return
-      var bytes = root.maxStatusBytes + 1
-      try { bytes = statusFile.data().byteLength } catch (e2) { bytes = raw.length * 3 }
-      if (bytes > root.maxStatusBytes) return
-      root.status = JSON.parse(raw)
-      root.now = new Date()
-      root.maybeLaunchVerification()
-    } catch (e) {
-      // partially-written or missing file — keep the previous snapshot
-    }
+  // ---- bounded snapshot reader ----
+  // The snapshot is never loaded through FileView: `head -c` bounds the
+  // producer to maxStatusBytes before a single byte reaches QML, and the
+  // parsed object is re-validated by Model.sanitizeSnapshot (types, string
+  // lengths, trip/flight cardinality, numeric finiteness, pairing URL shape)
+  // before it is assigned to any model. FileView is used only as a change
+  // watcher (preload: false — it never reads the file itself).
+
+  readonly property string statusPath: root.stateDir ? root.stateDir + "/status.json" : ""
+
+  function applySnapshotText(raw) {
+    var text = String(raw || "")
+    if (text.length === 0 || text.length > root.maxStatusBytes) return
+    var parsed = null
+    try { parsed = JSON.parse(text) } catch (e) { return }
+    var snapshot = Model.sanitizeSnapshot(parsed)
+    if (!snapshot) return
+    root.status = snapshot
+    root.now = new Date()
+    root.maybeLaunchVerification()
   }
+
+  function readSnapshot() {
+    if (!root.statusPath) return
+    if (readerProc.running) { readAgain.restart(); return }
+    readerProc.command = ["head", "-c", String(root.maxStatusBytes), root.statusPath]
+    readerProc.running = true
+  }
+
+  Process {
+    id: readerProc
+    // Producer-bounded: head -c caps the stream, so this collector can never
+    // hold more than maxStatusBytes.
+    stdout: StdioCollector { onStreamFinished: root.applySnapshotText(text) }
+  }
+  Timer { interval: root.watchdogMs; running: readerProc.running; onTriggered: readerProc.running = false }
+  Timer { id: readAgain; interval: 150; onTriggered: root.readSnapshot() }
 
   FileView {
     id: statusFile
-    path: root.stateDir ? root.stateDir + "/status.json" : ""
+    path: root.statusPath
+    preload: false
     watchChanges: true
-    onFileChanged: statusFile.reload()
-    onLoaded: root.reparseStatus()
+    onFileChanged: readAgain.restart()
   }
+
+  // Watcher fallback: atomic renames and first creation of the state dir can
+  // slip past a path watcher, so also re-read periodically and on startup.
+  Timer { interval: 300000; running: true; repeat: true; onTriggered: root.readSnapshot() }
+  Component.onCompleted: root.readSnapshot()
 
   // ---- pairing hand-off: the URL is built by the helper from the validated
   //      user code + pinned app origin and re-validated here before launch.
@@ -198,7 +226,7 @@ Item {
   Process {
     id: refreshProc
     environment: root.refreshEnv
-    onExited: statusFile.reload()
+    onExited: root.readSnapshot()
   }
   Timer { interval: root.watchdogMs; running: refreshProc.running; onTriggered: refreshProc.running = false }
 
@@ -207,7 +235,7 @@ Item {
     environment: root.syncEnv
     onExited: function(code) {
       if (code !== 0) root.launchPending = false
-      statusFile.reload()
+      root.readSnapshot()
     }
   }
   Timer { interval: root.watchdogMs; running: pairStartProc.running; onTriggered: pairStartProc.running = false }
@@ -219,7 +247,7 @@ Item {
     // exit 0 after approval already ran a refresh inside the helper.
     onExited: function(code) {
       if (code === 0) root.lastRefreshMs = Date.now()
-      statusFile.reload()
+      root.readSnapshot()
     }
   }
   Timer { interval: root.watchdogMs; running: pairPollProc.running; onTriggered: pairPollProc.running = false }
@@ -227,13 +255,14 @@ Item {
   Process {
     id: disconnectProc
     environment: root.syncEnv
-    onExited: statusFile.reload()
+    onExited: root.readSnapshot()
   }
   Timer { interval: root.watchdogMs; running: disconnectProc.running; onTriggered: disconnectProc.running = false }
 
   // Replacement/destruction (hot reload, plugin disable) must not orphan a
   // helper tree.
   Component.onDestruction: {
+    readerProc.running = false
     refreshProc.running = false
     pairStartProc.running = false
     pairPollProc.running = false

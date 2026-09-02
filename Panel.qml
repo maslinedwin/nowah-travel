@@ -50,10 +50,12 @@ Panel {
     return s && s[key] !== undefined ? s[key] : fallback
   }
 
+  // Persisted recents come back through shell.json (writable by any plugin),
+  // so they are re-bounded here before they reach the Repeater.
   function syncRecents() {
     var s = root.hostWidget ? root.hostWidget.settings : null
-    if (s && s.recentSearches && s.recentSearches.length !== undefined)
-      root.recents = s.recentSearches
+    if (s && s.recentSearches !== undefined)
+      root.recents = Model.sanitizeRecents(s.recentSearches)
   }
 
   onHostWidgetChanged: syncRecents()
@@ -90,9 +92,7 @@ Panel {
   }
 
   function rememberSearch(q) {
-    var next = [q]
-    for (var i = 0; i < root.recents.length && next.length < 4; i++)
-      if (root.recents[i] !== q) next.push(root.recents[i])
+    var next = Model.sanitizeRecents([q].concat(root.recents))
     root.recents = next
     if (root.hostWidget && typeof root.hostWidget.saveRecents === "function")
       root.hostWidget.saveRecents(next)
@@ -105,10 +105,15 @@ Panel {
   }
 
   function searchFor(query) {
-    var q = String(query || "").trim()
+    // Bounded at the entry point: length, whitespace, control/markup chars.
+    var q = Model.sanitizeQuery(query)
     if (q === "") return
+    // Encode BEFORE persisting: a query that cannot be encoded is never
+    // remembered, so a bad pill can never be stored.
+    var encoded = ""
+    try { encoded = encodeURIComponent(q) } catch (e) { return }
     root.rememberSearch(q)
-    root.launch("/?q=" + encodeURIComponent(q))
+    root.launch("/?q=" + encoded)
   }
 
   function submitQuery() { root.searchFor(queryInput.text) }
@@ -236,6 +241,7 @@ Panel {
 
           TextInput {
             id: queryInput
+            maximumLength: Model.MAX_QUERY_CHARS
             anchors.left: searchGlyph.right
             anchors.leftMargin: Style.space(8)
             anchors.right: enterBadge.visible ? enterBadge.left : parent.right
