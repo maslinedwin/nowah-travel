@@ -86,7 +86,9 @@ Panel {
   }
 
   function launch(path) {
-    Quickshell.execDetached(["omarchy-launch-webapp", root.appUrl + path])
+    // The helper owns the hand-off: it re-validates the path against the
+    // pinned origin and execs a verified absolute launcher (never PATH).
+    NowahService.launch(path)
     queryInput.text = ""
     root.close()
   }

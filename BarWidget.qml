@@ -130,7 +130,7 @@ BarWidget {
     }
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton)
-        Quickshell.execDetached(["omarchy-launch-webapp", NowahService.appUrl || "https://app.nowah.xyz"])
+        NowahService.launch("/")
       else
         root.toggle()
     }

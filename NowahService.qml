@@ -96,9 +96,11 @@ Item {
   }
 
   function readSnapshot() {
-    if (!root.statusPath) return
     if (readerProc.running) { readAgain.restart(); return }
-    readerProc.command = ["head", "-c", String(root.maxStatusBytes), root.statusPath]
+    // The helper reads at most maxStatusBytes through the same no-follow,
+    // non-blocking, fstat-verified primitive it uses everywhere else, and
+    // exits nonzero (printing nothing) when the file is larger or unusable.
+    readerProc.command = root.helperCommand(["read-snapshot"])
     readerProc.running = true
   }
 
@@ -140,7 +142,15 @@ Item {
     root.launchPending = false
     var url = String(root.pairing.verificationUrl || "")
     if (root.verifyUrlPattern.test(url))
-      Quickshell.execDetached(["omarchy-launch-webapp", url])
+      root.launch("/device?code=" + String(root.pairing.userCode || ""))
+  }
+
+  // Every browser hand-off goes through the helper, which validates the path
+  // against the pinned app origin and execs a verified absolute launcher.
+  function launch(path) {
+    if (launchProc.running) return
+    launchProc.command = root.helperCommand(["launch", String(path || "/")])
+    launchProc.running = true
   }
 
   // ---- helper process plumbing (every run bounded + supervised) ----
@@ -151,10 +161,16 @@ Item {
     try { return decodeURIComponent(path) } catch (e) { return path }
   }
 
+  // Absolute interpreter path: nothing this plugin runs is ever resolved
+  // through PATH, so a shadowed binary can never be executed.
+  readonly property string pythonBin: "/usr/bin/python3"
+
   // Null entries are UNSET in the helper's environment: the developer
   // override can only ever be engaged by hand, never inherited from the
-  // graphical session.
+  // graphical session. PATH is pinned as belt-and-braces; the helper itself
+  // resolves nothing through it.
   readonly property var syncEnv: ({
+    PATH: "/usr/local/bin:/usr/bin",
     NOWAH_SHOW_NOTIFICATIONS: root.showNotifications ? "1" : "0",
     NOWAH_DEV_API_ORIGIN: null,
     NOWAH_DEV_CONSENT: null,
@@ -166,10 +182,12 @@ Item {
   // never argv (a flight number reveals the user's travel to `ps`).
   property var refreshEnv: root.syncEnv
 
-  // timeout(1) is the whole-tree deadline (TERM at 60s, KILL 5s later); the
-  // per-process watchdog Timers below are the in-shell backstop.
+  // The helper enforces its own 40 s absolute deadline internally and stops
+  // if this process disappears; the watchdog Timers below terminate it if it
+  // somehow outlives that. Both the interpreter and the script are absolute
+  // paths, so no PATH lookup is involved.
   function helperCommand(args) {
-    return ["timeout", "-k", "5", "60", root.syncBin].concat(args)
+    return [root.pythonBin, root.syncBin].concat(args)
   }
 
   readonly property int watchdogMs: 75000
@@ -253,6 +271,12 @@ Item {
   Timer { interval: root.watchdogMs; running: pairPollProc.running; onTriggered: pairPollProc.running = false }
 
   Process {
+    id: launchProc
+    environment: root.syncEnv
+  }
+  Timer { interval: root.watchdogMs; running: launchProc.running; onTriggered: launchProc.running = false }
+
+  Process {
     id: disconnectProc
     environment: root.syncEnv
     onExited: root.readSnapshot()
@@ -262,6 +286,7 @@ Item {
   // Replacement/destruction (hot reload, plugin disable) must not orphan a
   // helper tree.
   Component.onDestruction: {
+    launchProc.running = false
     readerProc.running = false
     refreshProc.running = false
     pairStartProc.running = false

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "xyz.nowah.travel",
   "name": "Nowah",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "author": "Nowah",
   "license": "MIT",
   "description": "AI travel search plus your live Nowah trips in the bar — next-trip countdown, flight-day status dot, unread notifications, and one-keystroke deep links into a dedicated Nowah app window.",
