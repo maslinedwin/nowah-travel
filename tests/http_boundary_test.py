@@ -309,9 +309,12 @@ class HttpBoundaryTest(unittest.TestCase):
         import subprocess, tempfile
         with tempfile.TemporaryDirectory() as d:
             bogus = os.path.join(d, "bogus.pem")
-            open(bogus, "w").write("")
+            with open(bogus, "w") as fh:
+                fh.write("")
             cnf = os.path.join(d, "evil.cnf")
-            open(cnf, "w").write("openssl_conf = evil\n[evil]\nproviders = prov\n[prov]\nevil = evil_sect\n[evil_sect]\nmodule = /nonexistent/evil.so\nactivate = 1\n")
+            with open(cnf, "w") as fh:
+                fh.write("openssl_conf = evil\n[evil]\nproviders = prov\n[prov]\nevil = evil_sect\n"
+                         "[evil_sect]\nmodule = /nonexistent/evil.so\nactivate = 1\n")
             code = ("import importlib.machinery, importlib.util\n"
                     "l = importlib.machinery.SourceFileLoader('m', %r); s = importlib.util.spec_from_loader('m', l)\n"
                     "m = importlib.util.module_from_spec(s); l.exec_module(m)\n"
