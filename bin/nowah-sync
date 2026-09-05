@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3 -I
 """nowah-sync - state synchronizer for the Nowah Omarchy plugin.
 
 Talks only to the pinned Nowah production origin (device-code pairing +
@@ -7,6 +7,12 @@ $STATE_DIR/status.json which the Quickshell side (NowahService.qml) reads
 through this same helper.
 
 Security posture (see README "Privacy & disclosure"):
+
+  * The interpreter runs in isolated mode (-I): PYTHONPATH/PYTHONHOME and
+    every other PYTHON* variable are ignored, the user site-packages
+    directory and the script directory are never added to sys.path, so a
+    same-UID writer cannot inject code into the process that holds the
+    token. If launched without -I the helper re-execs itself with it.
 
   * No PATH resolution anywhere. This is Python stdlib only - no curl, jq,
     stat, mv, head, timeout or any other external program is executed for
@@ -35,6 +41,14 @@ Security posture (see README "Privacy & disclosure"):
     and reduced through a strict whitelist schema before they are published.
     One absolute deadline bounds the whole run.
 
+  * HTTP is a closed loop to the pinned origin: redirects are never followed
+    (any 3xx is a transport failure, so a bearer header can never travel to
+    another origin, a downgraded scheme, or a loopback/private service),
+    environment proxies are ignored, the handler chain is explicit (https
+    only - no file/ftp/data handlers), and the peer address is vetted
+    against loopback/private/link-local/reserved ranges and then pinned for
+    the connection, so a DNS answer cannot change between check and connect.
+
 Subcommands:
   refresh          sync trips (NOWAH_FLIGHT / NOWAH_FLIGHT_DATE add flight status)
   pair-start       begin pairing (verification URL lands in status.json)
@@ -44,14 +58,25 @@ Subcommands:
   launch PATH      open a pinned-origin app path in the Nowah web app window
 """
 
+import sys
+
+# Isolated mode is not optional: without it PYTHONPATH, sitecustomize and the
+# user site directory (all writable by any same-UID process) would be code
+# injection points into the process that holds the credential.
+if not sys.flags.isolated:
+    os_module = __import__("os")
+    os_module.execv(sys.executable, [sys.executable, "-I", "-B", *sys.argv])
+
 import errno
 import fcntl
+import http.client
+import ipaddress
 import json
 import os
 import re
+import socket
 import ssl
 import stat
-import sys
 import time
 import urllib.error
 import urllib.parse
@@ -108,7 +133,10 @@ USER_CODE_RE = re.compile(r"^[A-Z0-9]{4}-[A-Z0-9]{4}$")
 IDENT_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 FLIGHT_NUM_RE = re.compile(r"^[A-Z0-9]{2,8}$")
-APP_PATH_RE = re.compile(r"^/[A-Za-z0-9/_?=&.-]{0,200}$")
+# Paths we build ourselves: /trips/<id>, /device?code=..., /?q=<encodeURIComponent(query)>.
+# encodeURIComponent leaves A-Z a-z 0-9 - _ . ! ~ * ' ( ) unescaped and emits %XX
+# for everything else; 200 UTF-16 units encode to at most 1200 bytes (4-byte code points).
+APP_PATH_RE = re.compile(r"^/[A-Za-z0-9/_?=&.%+~!*'()-]{0,1400}$")
 # Markup delimiters, C0/C1 controls, and format/bidi/zero-width characters.
 STRIP_RE = re.compile(
     "[<>\u0000-\u001f\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f"
@@ -478,7 +506,7 @@ def load_prev(state):
         return {}
     try:
         doc = json.loads(raw.decode("utf-8", "replace"))
-    except ValueError:
+    except (ValueError, RecursionError):
         return {}
     return doc if isinstance(doc, dict) else {}
 
@@ -509,10 +537,105 @@ def prev_auth_error(prev):
 SSL_CONTEXT = ssl.create_default_context()
 SSL_CONTEXT.minimum_version = ssl.TLSVersion.TLSv1_2
 
+MAX_REDIRECTS = 0  # redirects are never followed; documented invariant
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect. A 3xx from the pinned origin surfaces as an
+    HTTPError that request() maps to a transport failure, so the follow-up
+    request - and the Authorization header - are never sent anywhere."""
+
+    max_redirections = MAX_REDIRECTS
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+    http_error_301 = http_error_302 = http_error_303 = http_error_307 = http_error_308 = (
+        lambda self, req, fp, code, msg, headers: None
+    )
+
+
+def address_is_public(address):
+    """True unless the address is loopback/private/link-local/multicast/
+    reserved/unspecified. IPv4-mapped IPv6 is unwrapped first."""
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return not (
+        ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_multicast
+        or ip.is_reserved or ip.is_unspecified or getattr(ip, "is_site_local", False)
+    )
+
+
+def resolve_pinned_address(host, port):
+    """Resolve once, vet every answer, and return the single address the
+    connection will use. Under the developer override (explicit consent, dev
+    state dir) loopback targets are allowed so the offline test-suite can run;
+    for the production origin any non-public answer is a hard failure."""
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError:
+        return None
+    candidates = []
+    for family, _type, _proto, _canon, sockaddr in infos:
+        address = sockaddr[0]
+        if API_ORIGIN == PROD_API_ORIGIN and not address_is_public(address):
+            return None  # poisoned or hijacked resolution: refuse the whole request
+        candidates.append((family, address))
+    if not candidates:
+        return None
+    # Prefer IPv4 for determinism; the vetted list is otherwise equivalent.
+    candidates.sort(key=lambda item: 0 if item[0] == socket.AF_INET else 1)
+    return candidates[0]
+
+
+def make_pinned_https_handler(host, family, address):
+    """An HTTPSHandler whose connections go to the pre-vetted address while
+    TLS verification and the Host header keep using the real hostname, so the
+    name we checked is the peer we talk to."""
+
+    class PinnedHTTPSConnection(http.client.HTTPSConnection):
+        def connect(self):
+            sock = socket.socket(family, socket.SOCK_STREAM)
+            sock.settimeout(self.timeout)
+            try:
+                sock.connect((address, self.port))
+            except OSError:
+                sock.close()
+                raise
+            self.sock = self._context.wrap_socket(sock, server_hostname=host)
+
+    class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(PinnedHTTPSConnection, req, context=SSL_CONTEXT)
+
+        https_request = urllib.request.AbstractHTTPHandler.do_request_
+
+    return PinnedHTTPSHandler()
+
+
+def build_opener(host, family, address):
+    """Explicit, minimal handler chain built from an empty OpenerDirector:
+    https only (no file/ftp/data/http handlers), no ProxyHandler at all (so
+    http(s)_proxy / all_proxy in the environment are never consulted), no
+    redirects, no cookies, no auth negotiation."""
+    opener = urllib.request.OpenerDirector()
+    for handler in (
+        NoRedirectHandler(),
+        urllib.request.HTTPDefaultErrorHandler(),
+        urllib.request.HTTPErrorProcessor(),
+        make_pinned_https_handler(host, family, address),
+    ):
+        opener.add_handler(handler)
+    return opener
+
 
 def request(url, limit, bearer=None, body=None):
     """Returns (status, bytes) or (0, b"") on any transport failure, size
-    overrun, deadline exhaustion, or non-https/off-origin URL."""
+    overrun, deadline exhaustion, redirect, or non-https/off-origin URL."""
     if not parent_alive():
         raise Fail("supervising process is gone")
     budget = remaining()
@@ -521,6 +644,14 @@ def request(url, limit, bearer=None, body=None):
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme != "https" or "%s://%s" % (parsed.scheme, parsed.netloc) != API_ORIGIN:
         return 0, b""
+    if not parsed.hostname:
+        return 0, b""
+    port = parsed.port or 443
+    pinned = resolve_pinned_address(parsed.hostname, port)
+    if pinned is None:
+        return 0, b""
+    family, address = pinned
+
     req = urllib.request.Request(url, method="POST" if body is not None else "GET")
     req.add_header("Accept", "application/json")
     req.add_header("User-Agent", "nowah-omarchy")
@@ -530,15 +661,19 @@ def request(url, limit, bearer=None, body=None):
     if body is not None:
         data = json.dumps(body, separators=(",", ":")).encode()
         req.add_header("Content-Type", "application/json")
-    opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=SSL_CONTEXT))
+    opener = build_opener(parsed.hostname, family, address)
     timeout = min(budget, max(CONNECT_TIMEOUT_S, budget))
     try:
         with opener.open(req, data=data, timeout=timeout) as resp:
+            if 300 <= resp.status < 400:
+                return 0, b""
             payload = resp.read(limit + 1)  # read one extra byte to detect overrun
             if len(payload) > limit:
                 return 0, b""
             return resp.status, payload
     except urllib.error.HTTPError as exc:
+        if 300 <= exc.code < 400:  # a refused redirect: never followed, never retried
+            return 0, b""
         try:
             payload = exc.read(limit + 1)
         except Exception:
@@ -553,7 +688,7 @@ def request(url, limit, bearer=None, body=None):
 def envelope(payload):
     try:
         doc = json.loads(payload.decode("utf-8", "replace"))
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     return doc if isinstance(doc, dict) else None
 
@@ -576,7 +711,7 @@ def load_token(state):
         return text, False
     try:
         doc = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):
         state.remove(TOKEN_LEAF)
         return None, True
     token = doc.get("token") if isinstance(doc, dict) else None
@@ -735,7 +870,7 @@ def cmd_pair_poll(state):
             candidate = doc.get("deviceCode") if isinstance(doc, dict) else None
             if isinstance(candidate, str) and DEVICE_CODE_RE.match(candidate):
                 device_code = candidate
-        except ValueError:
+        except (ValueError, RecursionError):
             pass
     if device_code is None:
         state.remove(DEVICE_LEAF)
@@ -792,10 +927,39 @@ def cmd_read_snapshot(state):
     return 0
 
 
-LAUNCHER_CANDIDATES = (
-    "/usr/local/bin/omarchy-launch-webapp",
-    "/usr/bin/omarchy-launch-webapp",
+def launcher_candidates():
+    """Fixed absolute locations only - never PATH. Omarchy ships its scripts
+    under ~/.local/share/omarchy/bin; system-wide installs are checked first."""
+    home = os.environ.get("HOME") or ""
+    candidates = ["/usr/local/bin/omarchy-launch-webapp", "/usr/bin/omarchy-launch-webapp"]
+    if home.startswith("/"):
+        candidates.append(os.path.join(home, ".local", "share", "omarchy", "bin", "omarchy-launch-webapp"))
+    return candidates
+
+
+# Session variables the browser launcher legitimately needs. Everything else
+# (LD_*, PYTHON*, *_proxy, NOWAH_*, ...) is dropped.
+LAUNCHER_ENV_ALLOWLIST = (
+    "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TERM",
+    "DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE", "XDG_SESSION_ID", "XDG_SEAT", "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_DESKTOP", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME",
+    "XDG_DATA_DIRS", "XDG_CONFIG_DIRS", "HYPRLAND_INSTANCE_SIGNATURE", "XCURSOR_THEME", "XCURSOR_SIZE",
+    "GDK_BACKEND", "QT_QPA_PLATFORM", "MOZ_ENABLE_WAYLAND", "ELECTRON_OZONE_PLATFORM_HINT",
+    "OMARCHY_PATH", "OMARCHY_INSTALL",
 )
+
+
+def launcher_environment():
+    env = {"PATH": "/usr/local/bin:/usr/bin"}
+    for key in LAUNCHER_ENV_ALLOWLIST:
+        value = os.environ.get(key)
+        if value is not None and "\0" not in value and key.startswith("LC_") is False:
+            env[key] = value
+    for key, value in os.environ.items():
+        if key.startswith("LC_") and "\0" not in value:
+            env[key] = value
+    return env
 
 
 def cmd_launch(path):
@@ -804,27 +968,24 @@ def cmd_launch(path):
     if not APP_PATH_RE.match(path):
         raise Fail("refusing to launch a non-app path")
     url = APP_ORIGIN + path
-    for candidate in LAUNCHER_CANDIDATES:
+    for candidate in launcher_candidates():
         try:
             st = os.stat(candidate, follow_symlinks=True)
         except OSError:
             continue
         if not stat.S_ISREG(st.st_mode) or not (st.st_mode & stat.S_IXUSR):
             continue
+        if st.st_uid not in (0, os.geteuid()):  # only root- or self-owned launchers
+            continue
         if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):  # group/world-writable launcher
             continue
+        # The launcher receives no credential material - only a URL on the
+        # pinned app origin - so it is not a trust boundary for the token;
+        # the checks above just keep us from executing something planted.
         if os.fork() == 0:
             os.setsid()
-            env = {
-                "PATH": "/usr/local/bin:/usr/bin",
-                "HOME": os.environ.get("HOME", ""),
-                "DISPLAY": os.environ.get("DISPLAY", ""),
-                "WAYLAND_DISPLAY": os.environ.get("WAYLAND_DISPLAY", ""),
-                "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", ""),
-                "XDG_CURRENT_DESKTOP": os.environ.get("XDG_CURRENT_DESKTOP", ""),
-            }
             try:
-                os.execve(candidate, [candidate, url], env)
+                os.execve(candidate, [candidate, url], launcher_environment())
             finally:
                 os._exit(127)
         return 0

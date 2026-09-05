@@ -187,7 +187,10 @@ Item {
   // somehow outlives that. Both the interpreter and the script are absolute
   // paths, so no PATH lookup is involved.
   function helperCommand(args) {
-    return [root.pythonBin, root.syncBin].concat(args)
+    // -I: isolated interpreter (PYTHON* env ignored, no user site, no
+    // script-dir import) so nothing user-writable can inject code into the
+    // process that holds the token; -B: never write bytecode next to the plugin.
+    return [root.pythonBin, "-I", "-B", root.syncBin].concat(args)
   }
 
   readonly property int watchdogMs: 75000
