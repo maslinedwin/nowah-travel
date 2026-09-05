@@ -210,6 +210,49 @@ class StateIoTest(unittest.TestCase):
         self.assertEqual(after["auth"]["state"], "pairing")
         self.assertEqual(after["auth"]["pairing"]["userCode"], "ABCD-EFGH")
 
+    def test_pairing_expiry_is_utc_regardless_of_local_timezone(self):
+        import time as _t
+        self.seed()
+        doc = self.status()
+        expires = _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(_t.time() + 600))
+        doc["auth"]["state"] = "pairing"
+        doc["auth"]["pairing"] = {"userCode": "ABCD-EFGH",
+                                  "verificationUrl": "https://app.nowah.xyz/device?code=ABCD-EFGH",
+                                  "expiresAt": expires, "interval": 5}
+        with open(self.leaf("status.json"), "w") as fh:
+            json.dump(doc, fh)
+        for tz in ("UTC", "Europe/Berlin", "Asia/Tokyo", "America/Los_Angeles", "Pacific/Auckland"):
+            self.assertEqual(run(self.home, "refresh", env={"TZ": tz}).returncode, 0)
+            self.assertEqual(self.status()["auth"]["state"], "pairing", "live pairing dropped under TZ=" + tz)
+
+    def test_disconnect_removes_the_credential_even_while_another_run_holds_the_lock(self):
+        import fcntl
+        self.seed()
+        with open(self.leaf("token"), "w") as fh:
+            json.dump({"origin": "https://127.0.0.1:9", "token": TOKEN}, fh)
+        dfd = os.open(self.state, os.O_RDONLY | os.O_DIRECTORY)
+        fcntl.flock(dfd, fcntl.LOCK_EX)
+        try:
+            proc = run(self.home, "disconnect", timeout=60)
+        finally:
+            fcntl.flock(dfd, fcntl.LOCK_UN)
+            os.close(dfd)
+        self.assertEqual(proc.returncode, 0)
+        self.assertFalse(os.path.exists(self.leaf("token")), "the credential must be gone regardless of the lock")
+
+    def test_pair_start_fails_loudly_when_the_state_is_busy(self):
+        import fcntl
+        self.seed()
+        dfd = os.open(self.state, os.O_RDONLY | os.O_DIRECTORY)
+        fcntl.flock(dfd, fcntl.LOCK_EX)
+        try:
+            proc = run(self.home, "pair-start", timeout=90)
+        finally:
+            fcntl.flock(dfd, fcntl.LOCK_UN)
+            os.close(dfd)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn(b"busy", proc.stderr)
+
     def test_dev_override_requires_explicit_consent(self):
         proc = subprocess.run(
             [PY, HELPER, "refresh"],

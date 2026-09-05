@@ -39,7 +39,9 @@ Security posture (see README "Privacy & disclosure"):
 
   * Responses are bounded on the wire (read limit+1, reject the extra byte)
     and reduced through a strict whitelist schema before they are published.
-    One absolute deadline bounds the whole run.
+    One wall-clock deadline (SIGALRM) bounds the whole run, including a peer
+    that drips bytes to keep per-operation timeouts alive; the shell's
+    watchdog is the backstop above that.
 
   * HTTP is a closed loop to the pinned origin: redirects are never followed
     (any 3xx is a transport failure, so a bearer header can never travel to
@@ -58,22 +60,48 @@ Subcommands:
   launch PATH      open a pinned-origin app path in the Nowah web app window
 """
 
+import os
 import sys
 
-# Isolated mode is not optional: without it PYTHONPATH, sitecustomize and the
-# user site directory (all writable by any same-UID process) would be code
-# injection points into the process that holds the credential.
-if not sys.flags.isolated:
-    os_module = __import__("os")
-    os_module.execv(sys.executable, [sys.executable, "-I", "-B", *sys.argv])
+# Environment variables that influence the dynamic linker, OpenSSL, or the
+# glibc resolver. `python -I` strips only PYTHON*; these are just as dangerous
+# for a process that holds a credential (a same-UID writer can persist them
+# into the graphical session), so they are removed before `ssl` is imported,
+# and a script image that saw them re-execs with the clean environment so the
+# linker never loaded anything under their influence either.
+SCRUBBED_ENV_PREFIXES = ("LD_", "PYTHON", "OPENSSL_", "SSL_CERT_", "MALLOC_", "GCONV_", "NLSPATH", "LOCPATH")
+SCRUBBED_ENV_VARS = ("LOCALDOMAIN", "RES_OPTIONS", "HOSTALIASES", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
 
+
+def scrub_environment(env):
+    """Return a copy of ENV without linker/OpenSSL/resolver influence."""
+    return {
+        key: value
+        for key, value in env.items()
+        if not key.startswith(SCRUBBED_ENV_PREFIXES) and key not in SCRUBBED_ENV_VARS
+    }
+
+
+_clean_env = scrub_environment(os.environ)
+_env_was_dirty = len(_clean_env) != len(os.environ)
+os.environ.clear()
+os.environ.update(_clean_env)
+
+if __name__ == "__main__" and (not sys.flags.isolated or _env_was_dirty):
+    # Isolated mode is not optional (PYTHONPATH/sitecustomize/user site are
+    # code-injection points), and a dirty environment must never reach the
+    # image that does TLS. The re-exec'd image is isolated and clean, so it
+    # never re-execs again.
+    os.execve(sys.executable, [sys.executable, "-I", "-B", *sys.argv], _clean_env)
+
+import calendar
 import errno
 import fcntl
 import http.client
 import ipaddress
 import json
-import os
 import re
+import signal
 import socket
 import ssl
 import stat
@@ -136,9 +164,17 @@ FLIGHT_NUM_RE = re.compile(r"^[A-Z0-9]{2,8}$")
 # Paths we build ourselves: /trips/<id>, /device?code=..., /?q=<encodeURIComponent(query)>.
 # encodeURIComponent leaves A-Z a-z 0-9 - _ . ! ~ * ' ( ) unescaped and emits %XX
 # for everything else; 200 UTF-16 units encode to at most 1200 bytes (4-byte code points).
-# No protocol-relative-looking "//" start and no ".." segments, even though the
-# origin is always prepended: the grammar admits only what the panel builds.
-APP_PATH_RE = re.compile(r"^/(?!/)(?!.*\.\.)[A-Za-z0-9/_?=&.%+~!*'()-]{0,1400}$")
+# No protocol-relative-looking "//" start, and no ".." *path segment*, even
+# though the origin is always prepended: the grammar admits only what the panel
+# builds. (An ellipsis inside the query - "/?q=Paris..." - is a legitimate search.)
+APP_PATH_RE = re.compile(r"^/(?!/)[A-Za-z0-9/_?=&.%+~!*'()-]{0,1400}$")
+
+
+def valid_app_path(path):
+    if not isinstance(path, str) or not APP_PATH_RE.match(path):
+        return False
+    segments = path.split("?", 1)[0].split("/")
+    return ".." not in segments
 # Markup delimiters, C0/C1 controls, and format/bidi/zero-width characters.
 STRIP_RE = re.compile(
     "[<>\u0000-\u001f\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f"
@@ -150,6 +186,26 @@ OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 
 class Fail(Exception):
     """Fatal, fail-closed error; nothing is published."""
+
+
+class Deadline(Exception):
+    """Raised from the SIGALRM handler when the run budget is exhausted."""
+
+
+def _on_alarm(signum, frame):
+    raise Deadline()
+
+
+def arm_deadline(seconds):
+    """Wall-clock bound for the whole run. A blocking socket read, TLS
+    handshake or resolver call is interrupted when it fires; request() maps
+    that to a transport failure and the run finishes with carried state."""
+    signal.signal(signal.SIGALRM, _on_alarm)
+    signal.setitimer(signal.ITIMER_REAL, max(0.01, seconds))
+
+
+def disarm_deadline():
+    signal.setitimer(signal.ITIMER_REAL, 0)
 
 
 def remaining() -> float:
@@ -203,9 +259,9 @@ class State:
         os.fchmod(self.fd, 0o700)
         self._sweep()
 
-    def lock(self) -> bool:
+    def lock(self, max_wait: float = 15.0) -> bool:
         """Serialise runs on the directory descriptor itself (no lock file)."""
-        deadline = time.monotonic() + min(remaining(), 15.0)
+        deadline = time.monotonic() + min(remaining(), max_wait)
         while True:
             try:
                 fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -275,7 +331,10 @@ class State:
             st = os.fstat(fd)
             if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_size != 0:
                 raise Fail("temp leaf is not a fresh regular file")
-            os.write(fd, data)
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
             os.fsync(fd)
         except BaseException:
             os.close(fd)
@@ -430,7 +489,7 @@ def s_flight_status(raw, want=None, max_age=None):
         if not fetched:
             return None
         try:
-            age = time.time() - time.mktime(time.strptime(fetched[:19], "%Y-%m-%dT%H:%M:%S"))
+            age = time.time() - calendar.timegm(time.strptime(fetched[:19], "%Y-%m-%dT%H:%M:%S"))
         except ValueError:
             return None
         if age > max_age:
@@ -536,8 +595,19 @@ def prev_auth_error(prev):
 # HTTP - stdlib only; credentials stay in memory
 # --------------------------------------------------------------------------
 
-SSL_CONTEXT = ssl.create_default_context()
-SSL_CONTEXT.minimum_version = ssl.TLSVersion.TLSv1_2
+def build_ssl_context():
+    """System trust store only. The environment has been scrubbed of
+    SSL_CERT_FILE/SSL_CERT_DIR/OPENSSL_* before this runs, so no user-writable
+    path can add a trust anchor."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.check_hostname = True
+    ctx.load_default_certs(ssl.Purpose.SERVER_AUTH)
+    return ctx
+
+
+SSL_CONTEXT = build_ssl_context()
 
 MAX_REDIRECTS = 0  # redirects are never followed; documented invariant
 
@@ -566,10 +636,14 @@ def address_is_public(address):
         return False
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped
-    return not (
+    if isinstance(ip, ipaddress.IPv4Address) and ip in ipaddress.ip_network("100.64.0.0/10"):
+        return False  # carrier-grade NAT / Tailscale range is not public
+    if (
         ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_multicast
         or ip.is_reserved or ip.is_unspecified or getattr(ip, "is_site_local", False)
-    )
+    ):
+        return False
+    return bool(ip.is_global)
 
 
 def resolve_pinned_address(host, port):
@@ -664,12 +738,28 @@ def request(url, limit, bearer=None, body=None):
         data = json.dumps(body, separators=(",", ":")).encode()
         req.add_header("Content-Type", "application/json")
     opener = build_opener(parsed.hostname, family, address)
-    timeout = min(budget, max(CONNECT_TIMEOUT_S, budget))
+    # Per-operation inactivity timeout; the SIGALRM deadline armed in main()
+    # is the wall-clock bound that a slow-drip peer cannot evade.
+    timeout = min(budget, CONNECT_TIMEOUT_S)
+
+    def bounded_read(stream):
+        chunks = []
+        total = 0
+        while total <= limit:
+            if remaining() <= 0:
+                raise Deadline()
+            chunk = stream.read(min(65536, limit + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        return b"".join(chunks)
+
     try:
         with opener.open(req, data=data, timeout=timeout) as resp:
             if 300 <= resp.status < 400:
                 return 0, b""
-            payload = resp.read(limit + 1)  # read one extra byte to detect overrun
+            payload = bounded_read(resp)  # reads one extra byte to detect overrun
             if len(payload) > limit:
                 return 0, b""
             return resp.status, payload
@@ -677,13 +767,13 @@ def request(url, limit, bearer=None, body=None):
         if 300 <= exc.code < 400:  # a refused redirect: never followed, never retried
             return 0, b""
         try:
-            payload = exc.read(limit + 1)
+            payload = bounded_read(exc)
         except Exception:
             payload = b""
         if len(payload) > limit:
             return 0, b""
         return exc.code, payload
-    except Exception:
+    except Exception:  # transport failure, TLS failure, Deadline, ...
         return 0, b""
 
 
@@ -745,7 +835,7 @@ def cmd_refresh(state):
         state_name = "signed_out"
         if pairing and pairing.get("expiresAt"):
             try:
-                expires = time.mktime(time.strptime(pairing["expiresAt"][:19], "%Y-%m-%dT%H:%M:%S"))
+                expires = calendar.timegm(time.strptime(pairing["expiresAt"][:19], "%Y-%m-%dT%H:%M:%S"))
                 if expires > time.time():
                     state_name = "pairing"
                 else:
@@ -757,7 +847,7 @@ def cmd_refresh(state):
         state.publish(STATUS_LEAF, build_status(state_name, auth_error, pairing, [], 0, None, True, ""))
         return 0
 
-    flight_num = (os.environ.get("NOWAH_FLIGHT") or "").replace(" ", "")
+    flight_num = re.sub(r"\s+", "", os.environ.get("NOWAH_FLIGHT") or "").upper()
     if not FLIGHT_NUM_RE.match(flight_num):
         flight_num = ""
     flight_date = os.environ.get("NOWAH_FLIGHT_DATE") or ""
@@ -967,7 +1057,7 @@ def launcher_environment():
 def cmd_launch(path):
     """Open a pinned-origin app URL. The launcher is resolved from a fixed list
     of absolute paths and verified before exec - never found through PATH."""
-    if not APP_PATH_RE.match(path):
+    if not valid_app_path(path):
         raise Fail("refusing to launch a non-app path")
     url = APP_ORIGIN + path
     for candidate in launcher_candidates():
@@ -979,14 +1069,25 @@ def cmd_launch(path):
             continue
         if st.st_uid not in (0, os.geteuid()):  # only root- or self-owned launchers
             continue
-        if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):  # group/world-writable launcher
+        if st.st_mode & stat.S_IWOTH:  # world-writable launcher
+            continue
+        if st.st_mode & stat.S_IWGRP and st.st_gid != os.getegid():  # writable by a foreign group
             continue
         # The launcher receives no credential material - only a URL on the
         # pinned app origin - so it is not a trust boundary for the token;
         # the checks above just keep us from executing something planted.
         if os.fork() == 0:
-            os.setsid()
             try:
+                os.setsid()
+                os.chdir("/")
+                # Detach from the shell's pipes: the browser must not inherit
+                # our stdio or keep a dead pipe for its lifetime.
+                devnull = os.open(os.devnull, os.O_RDWR)
+                for fd in (0, 1, 2):
+                    os.dup2(devnull, fd)
+                if devnull > 2:
+                    os.close(devnull)
+                signal.signal(signal.SIGPIPE, signal.SIG_DFL)
                 os.execve(candidate, [candidate, url], launcher_environment())
             finally:
                 os._exit(127)
@@ -1006,21 +1107,33 @@ def main(argv):
     state = State()
     if command == "read-snapshot":  # read-only, no lock needed
         return cmd_read_snapshot(state)
+    if command == "disconnect":
+        # The credential goes first, unconditionally: unlink is atomic and a
+        # concurrent refresh re-checks the token before publishing signed_in.
+        state.remove(TOKEN_LEAF)
+        state.remove(DEVICE_LEAF)
+        if not state.lock(max_wait=10.0):
+            return 0  # files are gone; the lock holder re-checks them and republishes signed_out
+        return cmd_disconnect(state)
+    if command == "pair-start":
+        if not state.lock(max_wait=10.0):
+            raise Fail("state is busy; try again")  # nonzero so the shell resets its pairing UI
+        return cmd_pair_start(state)
     if not state.lock() or remaining() < 5:
         # Another run owns the state; it publishes a fresh snapshot itself.
         return 10 if command == "pair-poll" else 0
     if command == "refresh":
         return cmd_refresh(state)
-    if command == "pair-start":
-        return cmd_pair_start(state)
-    if command == "pair-poll":
-        return cmd_pair_poll(state)
-    return cmd_disconnect(state)
+    return cmd_pair_poll(state)
 
 
 if __name__ == "__main__":
     try:
+        arm_deadline(RUN_BUDGET_S)
         sys.exit(main(sys.argv))
+    except Deadline:
+        sys.stderr.write("nowah-sync: run budget exhausted\n")
+        sys.exit(1)
     except Fail as exc:
         sys.stderr.write("nowah-sync: %s\n" % exc)
         sys.exit(1)

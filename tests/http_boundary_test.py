@@ -97,6 +97,21 @@ def make_handler(recorder, self_origin, other_origin):
                 return self._redirect(308, self_origin + "/landed")
             if self.path == "/landed":
                 return self._json(200, {"success": True, "data": {"landed": True}})
+            if self.path == "/drip":
+                # A peer that keeps every socket operation alive but never finishes.
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "400")
+                self.end_headers()
+                import time as _t
+                try:
+                    for _ in range(400):
+                        self.wfile.write(b"x")
+                        self.wfile.flush()
+                        _t.sleep(0.25)
+                except (BrokenPipeError, ConnectionResetError, ssl.SSLError, OSError):
+                    pass
+                return
             return self._json(404, {"success": False, "error": {"code": "NOT_FOUND"}})
 
         do_POST = do_GET
@@ -236,16 +251,18 @@ class HttpBoundaryTest(unittest.TestCase):
     def test_address_classifier(self):
         public = self.mod.address_is_public
         for bad in ("127.0.0.1", "10.1.2.3", "172.16.0.9", "192.168.1.1", "169.254.169.254", "::1",
-                    "fe80::1", "fc00::1", "0.0.0.0", "224.0.0.1", "::ffff:127.0.0.1", "not-an-ip"):
+                    "fe80::1", "fc00::1", "0.0.0.0", "224.0.0.1", "::ffff:127.0.0.1", "not-an-ip",
+                    "100.64.0.1", "100.127.255.254", "198.18.0.1", "2002:7f00:1::1", "64:ff9b::7f00:1",
+                    "::ffff:10.0.0.1"):
             self.assertFalse(public(bad), bad)
         for good in ("1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"):
             self.assertTrue(public(good), good)
 
     def test_app_path_grammar_accepts_what_the_panel_builds_and_rejects_the_rest(self):
-        accept = self.mod.APP_PATH_RE.match
+        accept = self.mod.valid_app_path
         for good in ("/", "/trips", "/trips/abc_DEF-123", "/device?code=ABCD-EFGH", "/plan",
                      "/?q=Flights%20to%20Tokyo%20in%20March", "/?q=" + "%C3%A9" * 200,
-                     "/?q=Rome%20(kids)%20~5-day%20*trip*%20!"):
+                     "/?q=Rome%20(kids)%20~5-day%20*trip*%20!", "/?q=Paris...", "/?q=what%20about%20Lisbon..%3F"):
             self.assertTrue(accept(good), good)
         for bad in ("", "trips", "//evil.example", "/trips/../device", "/..", "/a/./../b", "/x\nnewline", "/x y", "https://app.nowah.xyz/",
                     "/?q=<script>", "/?q=\"quoted\"", "/" + "a" * 1500, "/\u200b"):
@@ -265,6 +282,50 @@ class HttpBoundaryTest(unittest.TestCase):
             # Reached our own argument validation (exit 1 + message), not the planted module.
             self.assertEqual(proc.returncode, 1, proc.stderr)
             self.assertIn(b"refusing to launch", proc.stderr)
+
+    def test_slow_drip_response_is_cut_by_the_wall_clock_deadline(self):
+        import time as _t
+        self.mod.DEADLINE = self.mod.time.monotonic() + 2.0
+        self.mod.arm_deadline(2.0)
+        started = _t.monotonic()
+        try:
+            status, body = self.get("/drip")
+        finally:
+            self.mod.disarm_deadline()
+        elapsed = _t.monotonic() - started
+        self.assertEqual((status, body), (0, b""), "a dripping peer must end as a transport failure")
+        self.assertLess(elapsed, 6.0, "the deadline must cut the read, not the per-op timeout: %.1fs" % elapsed)
+
+    def test_environment_scrub_removes_linker_openssl_and_resolver_influence(self):
+        dirty = {"PATH": "/usr/bin", "HOME": "/h", "LD_PRELOAD": "/evil.so", "LD_LIBRARY_PATH": "/x",
+                 "OPENSSL_CONF": "/evil.cnf", "OPENSSL_MODULES": "/m", "OPENSSL_ENGINES": "/e",
+                 "SSL_CERT_FILE": "/evil.pem", "SSL_CERT_DIR": "/d", "PYTHONPATH": "/p", "PYTHONHOME": "/ph",
+                 "LOCALDOMAIN": "evil.example", "RES_OPTIONS": "ndots:5", "HOSTALIASES": "/aliases",
+                 "REQUESTS_CA_BUNDLE": "/b", "MALLOC_PERTURB_": "1", "GCONV_PATH": "/g", "NOWAH_FLIGHT": "TK12"}
+        clean = self.mod.scrub_environment(dirty)
+        self.assertEqual(sorted(clean), ["HOME", "NOWAH_FLIGHT", "PATH"])
+
+    def test_ssl_context_ignores_SSL_CERT_FILE_and_OPENSSL_CONF_from_the_environment(self):
+        import subprocess, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            bogus = os.path.join(d, "bogus.pem")
+            open(bogus, "w").write("")
+            cnf = os.path.join(d, "evil.cnf")
+            open(cnf, "w").write("openssl_conf = evil\n[evil]\nproviders = prov\n[prov]\nevil = evil_sect\n[evil_sect]\nmodule = /nonexistent/evil.so\nactivate = 1\n")
+            code = ("import importlib.machinery, importlib.util\n"
+                    "l = importlib.machinery.SourceFileLoader('m', %r); s = importlib.util.spec_from_loader('m', l)\n"
+                    "m = importlib.util.module_from_spec(s); l.exec_module(m)\n"
+                    "import os\n"
+                    "print(m.SSL_CONTEXT.cert_store_stats()['x509_ca'], 'SSL_CERT_FILE' in os.environ, 'OPENSSL_CONF' in os.environ)\n") % HELPER
+            proc = subprocess.run([sys.executable, "-I", "-c", code],
+                                  env={"PATH": "", "HOME": d, "SSL_CERT_FILE": bogus, "SSL_CERT_DIR": d,
+                                       "OPENSSL_CONF": cnf, "NOWAH_DEV_API_ORIGIN": self.self_origin,
+                                       "NOWAH_DEV_CONSENT": "1"},
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            cas, cert_file_present, conf_present = proc.stdout.split()
+            self.assertGreater(int(cas), 0, "the SYSTEM trust store must be loaded, not the empty SSL_CERT_FILE")
+            self.assertEqual((cert_file_present, conf_present), ("False", "False"), "scrubbed before ssl import")
 
     def test_deeply_nested_json_is_rejected_not_crashing(self):
         deep = ("[" * 100000) + ("]" * 100000)

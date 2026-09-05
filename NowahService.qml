@@ -74,8 +74,9 @@ Item {
   }
 
   // ---- bounded snapshot reader ----
-  // The snapshot is never loaded through FileView: `head -c` bounds the
-  // producer to maxStatusBytes before a single byte reaches QML, and the
+  // The snapshot is never loaded through FileView: the helper's read-snapshot
+  // reads it through a no-follow, non-blocking, fstat-verified open, prints at
+  // most maxStatusBytes (and nothing at all when the file is larger), and the
   // parsed object is re-validated by Model.sanitizeSnapshot (types, string
   // lengths, trip/flight cardinality, numeric finiteness, pairing URL shape)
   // before it is assigned to any model. FileView is used only as a change
@@ -106,8 +107,11 @@ Item {
 
   Process {
     id: readerProc
-    // Producer-bounded: head -c caps the stream, so this collector can never
-    // hold more than maxStatusBytes.
+    clearEnvironment: true
+    environment: root.syncEnv
+    // Producer-bounded: the helper's read-snapshot prints at most
+    // maxStatusBytes and prints nothing (exit 2) when the file is larger, so
+    // this collector can never hold more than that.
     stdout: StdioCollector { onStreamFinished: root.applySnapshotText(text) }
   }
   Timer { interval: root.watchdogMs; running: readerProc.running; onTriggered: readerProc.running = false }
@@ -165,18 +169,36 @@ Item {
   // through PATH, so a shadowed binary can never be executed.
   readonly property string pythonBin: "/usr/bin/python3"
 
-  // Null entries are UNSET in the helper's environment: the developer
-  // override can only ever be engaged by hand, never inherited from the
-  // graphical session. PATH is pinned as belt-and-braces; the helper itself
-  // resolves nothing through it.
-  readonly property var syncEnv: ({
-    PATH: "/usr/local/bin:/usr/bin",
-    NOWAH_SHOW_NOTIFICATIONS: root.showNotifications ? "1" : "0",
-    NOWAH_DEV_API_ORIGIN: null,
-    NOWAH_DEV_CONSENT: null,
-    NOWAH_FLIGHT: null,
-    NOWAH_FLIGHT_DATE: null
-  })
+  // Every helper Process runs with clearEnvironment: true and receives ONLY
+  // this allowlist. The graphical session's environment is never inherited,
+  // so LD_PRELOAD, OPENSSL_CONF, SSL_CERT_FILE, resolver variables, PYTHON*,
+  // proxies and the developer override can never reach the process that
+  // holds the token. Session variables the browser launcher legitimately
+  // needs are passed through by name.
+  readonly property var sessionKeys: [
+    "HOME", "USER", "LOGNAME", "LANG", "LANGUAGE", "LC_ALL", "LC_MESSAGES", "LC_TIME",
+    "DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE", "XDG_SESSION_ID", "XDG_SEAT", "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_DESKTOP", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME",
+    "XDG_DATA_DIRS", "XDG_CONFIG_DIRS", "HYPRLAND_INSTANCE_SIGNATURE", "XCURSOR_THEME", "XCURSOR_SIZE",
+    "GDK_BACKEND", "QT_QPA_PLATFORM", "OMARCHY_PATH", "OMARCHY_INSTALL"
+  ]
+
+  function baseEnv() {
+    var env = { PATH: "/usr/local/bin:/usr/bin" }
+    for (var i = 0; i < root.sessionKeys.length; i++) {
+      var value = Quickshell.env(root.sessionKeys[i])
+      if (value !== null && value !== undefined && String(value).length > 0)
+        env[root.sessionKeys[i]] = String(value)
+    }
+    return env
+  }
+
+  readonly property var syncEnv: {
+    var env = root.baseEnv()
+    env.NOWAH_SHOW_NOTIFICATIONS = root.showNotifications ? "1" : "0"
+    return env
+  }
 
   // Flight identity travels to the refresh run through its environment,
   // never argv (a flight number reveals the user's travel to `ps`).
@@ -198,8 +220,8 @@ Item {
   property double lastRefreshMs: 0
 
   function currentFlightEnv() {
-    var env = {}
-    for (var k in root.syncEnv) env[k] = root.syncEnv[k]
+    var env = root.baseEnv()
+    env.NOWAH_SHOW_NOTIFICATIONS = root.showNotifications ? "1" : "0"
     var m = root.monitor
     if (root.flightDay && m && m.seg && m.seg.flight && m.seg.flight.flightNumber) {
       env.NOWAH_FLIGHT = String(m.seg.flight.flightNumber)
@@ -246,6 +268,7 @@ Item {
 
   Process {
     id: refreshProc
+    clearEnvironment: true
     environment: root.refreshEnv
     onExited: root.readSnapshot()
   }
@@ -253,6 +276,7 @@ Item {
 
   Process {
     id: pairStartProc
+    clearEnvironment: true
     environment: root.syncEnv
     onExited: function(code) {
       if (code !== 0) root.launchPending = false
@@ -263,6 +287,7 @@ Item {
 
   Process {
     id: pairPollProc
+    clearEnvironment: true
     environment: root.syncEnv
     // exit 10 = authorization pending; pairTimer simply polls again.
     // exit 0 after approval already ran a refresh inside the helper.
@@ -275,12 +300,14 @@ Item {
 
   Process {
     id: launchProc
+    clearEnvironment: true
     environment: root.syncEnv
   }
   Timer { interval: root.watchdogMs; running: launchProc.running; onTriggered: launchProc.running = false }
 
   Process {
     id: disconnectProc
+    clearEnvironment: true
     environment: root.syncEnv
     onExited: root.readSnapshot()
   }
