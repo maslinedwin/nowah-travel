@@ -247,7 +247,7 @@ class HttpBoundaryTest(unittest.TestCase):
                      "/?q=Flights%20to%20Tokyo%20in%20March", "/?q=" + "%C3%A9" * 200,
                      "/?q=Rome%20(kids)%20~5-day%20*trip*%20!"):
             self.assertTrue(accept(good), good)
-        for bad in ("", "trips", "//evil.example", "/x\nnewline", "/x y", "https://app.nowah.xyz/",
+        for bad in ("", "trips", "//evil.example", "/trips/../device", "/..", "/a/./../b", "/x\nnewline", "/x y", "https://app.nowah.xyz/",
                     "/?q=<script>", "/?q=\"quoted\"", "/" + "a" * 1500, "/\u200b"):
             self.assertFalse(accept(bad), repr(bad))
 
